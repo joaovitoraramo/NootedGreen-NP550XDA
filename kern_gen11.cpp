@@ -1266,6 +1266,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN24AppleIntelBaseController16hwDoGMBusRequestEjjP12IOI2CRequest", wrapGMBusRequest, this->oGMBusRequest},
 			{"__ZN21AppleIntelFramebuffer13hasDDCConnectEi", wrapHasDDCConnect, this->oHasDDCConnect},
 			{"__ZN14AppleIntelPort14probePortStateEv", wrapProbePortState, this->oProbePortState},
+			{"__ZN17AppleIntelPortHAL11getHPDStateEv", wrapGetHPDState, this->oGetHPDState},
+			{"__ZN14AppleIntelPort8isHPDLowEv", wrapIsHPDLow, this->oIsHPDLow},
 			// V96: Force display online — WEG's getDisplayStatus hook (FOD) fails with
 			// "err 2" on TGL kext because that symbol doesn't exist. TGL uses getOnlineInfo.
 			{"__ZN21AppleIntelFramebuffer13getOnlineInfoEP21AppleIntelDisplayPathPhS2_", getOnlineInfo, this->ogetOnlineInfo},
@@ -3463,6 +3465,20 @@ uint64_t Gen11::wrapProbePortState(void *that) {
 	uint64_t r = FunctionCast(wrapProbePortState, callback->oProbePortState)(that);
 	HPDLOG(n, "XeNG HPD probePortState ddi=%u mode=%u -> 0x%llx SDEISR=%08x\n", hpdDdi(that), that ? getMember<uint32_t>(that, 0x550) : 0, r,
 		   NGreen::callback->readReg32(0xC4000));
+	return r;
+}
+
+uint64_t Gen11::wrapGetHPDState(void *that) {
+	uint64_t r = FunctionCast(wrapGetHPDState, callback->oGetHPDState)(that);
+	if (hpdDdi(that) == 3)
+		HPDLOG(n, "XeNG HPD getHPDState ddi=3 -> %llu SDEISR=%08x DEHPD=%08x SHOTPLUG_DDI=%08x SHOTPLUG_TC=%08x TC_HP=%08x\n", r,
+			   NGreen::callback->readReg32(0xC4000), NGreen::callback->readReg32(0x44470), NGreen::callback->readReg32(0xC4030),
+			   NGreen::callback->readReg32(0xC4034), NGreen::callback->readReg32(0x44038));
+	return r;
+}
+uint64_t Gen11::wrapIsHPDLow(void *that) {
+	uint64_t r = FunctionCast(wrapIsHPDLow, callback->oIsHPDLow)(that);
+	HPDLOG(n, "XeNG HPD isHPDLow ddi=%u -> %llu\n", hpdDdi(that), r & 0xFF);
 	return r;
 }
 

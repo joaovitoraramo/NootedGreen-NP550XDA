@@ -1563,6 +1563,9 @@ private:
 	static uint64_t wrapGMBusRequest(void *that, uint32_t pin, uint32_t x, void *req);
 	static uint64_t wrapHasDDCConnect(void *that, int conn);
 	static uint64_t wrapProbePortState(void *that);
+	static uint64_t wrapGetHPDState(void *that);
+	static uint64_t wrapIsHPDLow(void *that);
+	mach_vm_address_t oGetHPDState {}, oIsHPDLow {};
 	mach_vm_address_t oInvokeHotplug {}, oHalSetPortMode {}, oPortGetDDCBlock {}, oGMBusRequest {}, oHasDDCConnect {}, oProbePortState {};
 	mach_vm_address_t orgICLReadAUX {};
 	
