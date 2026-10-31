@@ -17,6 +17,7 @@ static uint64_t agdcT_SetFbStatusOnNextProbe(void *that, uint32_t *a);
 static uint64_t agdcT_connectionChanged(void *that);
 static mach_vm_address_t gAgdcOrig[12] {};
 static bool hdmiEmuOn();
+static volatile uint32_t gGmbusPin = 0;   // NP550 HDMIEMU: pino do pedido GMBUS em curso (o FB não grava o GMBUS0)
 #include "AppleIntelParams.hpp"
 #include <Headers/kern_api.hpp>
 #include "kern_genx.hpp"
@@ -3526,8 +3527,10 @@ static void hdmiEmuPowerTc1(const char *why) {
 	}
 }
 uint64_t Gen11::wrapGMBusRequest(void *that, uint32_t pin, uint32_t x, void *req) {
-	if (pin == 9 && hdmiEmuOn()) hdmiEmuPowerTc1("gmbus");
+	bool emu = pin == 9 && hdmiEmuOn();
+	if (emu) { hdmiEmuPowerTc1("gmbus"); gGmbusPin = pin; }
 	uint64_t r = FunctionCast(wrapGMBusRequest, callback->oGMBusRequest)(that, pin, x, req);
+	if (emu) gGmbusPin = 0;
 	HPDLOG(n, "XeNG HPD GMBus pin=%u x=%u ret=0x%llx GMBUS0=%08x GMBUS2=%08x\n", pin, x, r,
 		   NGreen::callback->readReg32(0xC5100), NGreen::callback->readReg32(0xC5108));
 	return r;
@@ -4270,6 +4273,13 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 		uint32_t r = (uint32_t)(reg & 0x1FFFFF);
 		if (r == 0x7019C) xeFenceScan(false);
 		val = xeFenceFilterWrite(r, val);
+		// NP550 HDMIEMU: o hwDoGMBusRequest da Apple dispara o GMBUS1 (SW_RDY) sem nunca gravar o pino no GMBUS0 (fica 0 =
+		// nenhum pino e o barramento fica ACTIVE até o timeout). Durante um pedido no pino 9 grava GMBUS0 antes do disparo.
+		if (r == 0xC5104 && gGmbusPin && (val & 0x40000000u) && NGreen::callback) {
+			NGreen::callback->writeReg32(0xC5100, gGmbusPin);
+			static int n = 0;
+			if (n++ < 10) IOLog("XeNG HDMIEMU GMBUS0 <- %u antes de GMBUS1=%08x\n", gGmbusPin, val);
+		}
 		// NP550 HDMIEMU: escritas do modeset da porta externa (clocks/DDI D/transcoders B-D/DPCLKA/PHY DKL da TC1)
 		static int hdmiW = -1;
 		if (hdmiW < 0) hdmiW = checkKernelArgument("-ngreenhdmiemu") ? 0 : 1000000;
