@@ -4615,6 +4615,12 @@ uint64_t Gen11::getOSInformation(AppleIntel::AppleIntelBaseController *that)
 					char nm[24]; uint32_t v;
 					snprintf(nm, sizeof(nm), "ngreencon%dtype", i);
 					if (PE_parse_boot_argn(nm, &v, sizeof(v))) { SYSLOG("ngreen", "TGLCON: con%d type 0x%x -> 0x%x", i, c.type, v); c.type = v; }
+					// +0x8 ("pipe" aqui) é o tipo de enlace que AppleIntelPort::getDDCBlock usa: 0 eDP, 1 DP (EDID por AUX),
+					// 2 HDMI (EDID por GMBUS no pino busId). +0x4 = busId (pino GMBUS/DDC).
+					snprintf(nm, sizeof(nm), "ngreencon%dpipe", i);
+					if (PE_parse_boot_argn(nm, &v, sizeof(v))) { SYSLOG("ngreen", "TGLCON: con%d pipe(link) %u -> %u", i, c.pipe, v); c.pipe = v; }
+					snprintf(nm, sizeof(nm), "ngreencon%dbusid", i);
+					if (PE_parse_boot_argn(nm, &v, sizeof(v))) { SYSLOG("ngreen", "TGLCON: con%d busId 0x%x -> 0x%x", i, c.busId, v); c.busId = v; }
 					snprintf(nm, sizeof(nm), "ngreencon%dflags", i);
 					if (PE_parse_boot_argn(nm, &v, sizeof(v))) { SYSLOG("ngreen", "TGLCON: con%d flags 0x%x -> 0x%x", i, c.flags, v); c.flags = v; }
 					SYSLOG("ngreen", "TGLCON:   con%d index=%d busId=0x%x pipe=%u pad=0x%x type=0x%x flags=0x%x", i, (int)c.index, c.busId, c.pipe, c.pad, c.type, c.flags);
