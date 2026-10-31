@@ -34,6 +34,8 @@ static constexpr uint32_t kHdmiEmuDdi = 3;   // NP550 HDMIEMU: HDMI legado na TC
 static bool hdmiEmuOn();
 static void hdmiEmuScheduleOutput();
 static void hdmiEmuEnableOutputNow();
+static uint32_t hdmiOutKeep(uint32_t r, uint32_t val);
+static uint32_t hdmiOutRemapBuf(uint32_t v);
 static volatile uint32_t gHdmiOutState = 0;   // NP550 HDMIEMU: 0 nada, 1 agendado/em curso, 2 aceso
 static bool hdmiEmuPort(void *that);
 static void hdmiEmuPowerTc1(const char *why);
@@ -3878,6 +3880,10 @@ static void hdmiEmuEnableOutput() {
 		dklWrite(ln, 0x2C4, 0x10000007);   // TX_DPCNTL1
 		dklWrite(ln, 0x2C8, 0x00000000);   // TX_DPCNTL2
 	}
+	// 4b. DBUF: fatia S2 ligada e DDB do pipe B dentro dela (a Apple o põe por cima do pipe A)
+	wr(0x44FE8, rd(0x44FE8) | 0x80000000u);
+	bool s2 = waitBits(0x44FE8, 0x40000000u, 0x40000000u, 10000);
+	wr(0x7127C, hdmiOutRemapBuf(rd(0x7127C)));
 	// 5. transcoder B: clock da porta D, timings 1080p60 (2200x1125), PIPEMISC e modo HDMI 12 bpc
 	wr(0x46144, 0x40000000);
 	wr(0x61000, 0x0897077F); wr(0x61004, 0x0897077F); wr(0x61008, 0x080307D7);
@@ -3886,9 +3892,11 @@ static void hdmiEmuEnableOutput() {
 	wr(0x61400, 0xA0330000);
 	wr(0x71008, rd(0x71008) | 0x80000000u);
 	bool tr = waitBits(0x71008, 1u << 30, 1u << 30, 50000);
-	// 6. buffer da DDI D
+	// 6. buffer da DDI D; regravar a superfície do plano B trava (latch) o novo DDB
 	wr(0x64300, 0x80000000);
 	IODelay(600);
+	wr(0x7119C, rd(0x7119C));
+	IOLog("XeNG HDMIOUT dbuf: S2 %d S1=%08x S2=%08x P1BUF_A=%08x P1BUF_B=%08x\n", s2, rd(0x45008), rd(0x44FE8), rd(0x7027C), rd(0x7127C));
 	IOLog("XeNG HDMIOUT fim: pllpwr=%d lock=%d io=%d trans=%d | PLL=%08x PW_DDI=%08x MLE=%08x CLKSEL=%08x FUNC_B=%08x CONF_B=%08x DDI_BUF_D=%08x "
 		  "DIV0=%08x DPMODE=%08x PIPEMISC=%08x PLANE_B=%08x SURF_B=%08x\n", pwr, lock, io, tr, rd(0x46030), rd(0x45454), rd(0x1638C0), rd(0x4610C),
 		  rd(0x61400), rd(0x71008), rd(0x64300), dklRead(2, 0x200), dklRead(0, 0x0A0), rd(0x71030), rd(0x71180), rd(0x7119C));
@@ -3907,6 +3915,32 @@ static void hdmiEmuDiag() {
 		  rd(0x7127C), rd(0x7117C), rd(0x71240), rd(0x44410), rd(0x71040), rd(0x71000) & 0x1FFF, rd(0x71008), rd(0x61400), rd(0x64300),
 		  rd(0x71180), rd(0x46000), rd(0x45038), rd(0x70028), rd(0x71028));
 	if (++ticks < 20) { uint64_t d; clock_interval_to_deadline(3, kSecondScale, &d); thread_call_enter_delayed(gHdmiDiagTc, d); }
+}
+// DDB do pipe B inteiro na fatia S2 (blocos 0x400..), longe do pipe A (S1); cursor B já fica em 0x7b0..
+static uint32_t hdmiOutRemapBuf(uint32_t v) {
+	uint32_t st = v & 0x7FF, en = (v >> 16) & 0x7FF;
+	if (!(v & 0x7FF07FF) || st >= 0x400 || en < st) return v;
+	uint32_t size = en - st;
+	if (size > 0x3A0) size = 0x3A0;   // até 0x7a0, antes do cursor B (0x7b0)
+	return (v & ~0x07FF07FFu) | ((0x400 + size) << 16) | 0x400;
+}
+static uint32_t hdmiOutKeep(uint32_t r, uint32_t val) {
+	uint32_t nv = val;
+	switch (r) {
+		case 0x64300: nv = 0x80000000; break;                    // DDI_BUF_CTL D ligado (HDMI)
+		case 0x61400: nv = 0xA0330000; break;                    // TRANS_DDI_FUNC_CTL B: porta D, HDMI, 12 bpc
+		case 0x46144: nv = 0x40000000; break;                    // TRANS_CLK_SEL B = porta D
+		case 0x4610C: nv = 0x80000000; break;                    // DDI_CLK_SEL D = TC PLL
+		case 0x46030: nv = val | 0x88000000u; break;             // TC PLL 1 ligado e alimentado
+		case 0x45454: nv = val | 0x80; break;                    // IO da DDI TC1
+		case 0x45444: nv = val | 0x80; break;                    // AUX da TC1 (DDC/HPD)
+		case 0x1638C0: nv = (val & ~0xFu) | 0xF; break;          // FIA: 4 lanes na TC1
+		case 0x44FE8: nv = val | 0x80000000u; break;             // DBUF fatia S2 ligada
+		case 0x7127C: case 0x7137C: nv = hdmiOutRemapBuf(val); break;   // DDB dos planos do pipe B na S2
+		default: return val;
+	}
+	if (nv != val) { static int n = 0; if (n++ < 40) IOLog("XeNG HDMIOUT keep %06x %08x -> %08x\n", r, val, nv); }
+	return nv;
 }
 static void hdmiEmuEnableOutputNow() {
 	gHdmiOutState = 1;
@@ -4558,6 +4592,9 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 		uint32_t r = (uint32_t)(reg & 0x1FFFFF);
 		if (r == 0x7019C) xeFenceScan(false);
 		val = xeFenceFilterWrite(r, val);
+		// NP550 HDMIOUT: com a saída HDMI acesa, o caminho DP da Apple desfaz o que não reconhece (desliga o buffer da DDI D,
+		// o IO da TC1...) e põe o DDB do pipe B por cima do pipe A e na fatia S2 desligada (underrun = faixas no painel).
+		if (gHdmiOutState == 2 && hdmiEmuOn()) val = hdmiOutKeep(r, val);
 		// NP550 HDMIEMU fase B: a Apple apontou o plano 1 do pipe B para a área de trabalho estendida -> acender a saída HDMI
 		if (r == 0x7119C && val && hdmiEmuOn() && checkKernelArgument("-ngreenhdmiout")) hdmiEmuScheduleOutput();
 		// NP550 HDMIEMU: o hwDoGMBusRequest da Apple dispara o GMBUS1 (SW_RDY) sem nunca gravar o pino no GMBUS0 (fica 0 =
