@@ -7045,7 +7045,9 @@ static bool gXeFbFake = false;
 IOReturn Gen11::wrapSetFramebufferPowerState(void *that, unsigned int state)
 {
 	static int on = -1;
-	if (on < 0) on = (xeFixEnabled() && !checkKernelArgument("-ngreenfbdpms")) ? 1 : 0;
+	// NP550 (31/10): no TGL real o FB também não religa o link eDP ao acordar ("FB0: Insufficient link bandwidth to support
+	// bpc 24" + "Bringup TODO: implement link rate determination from HW values") -> -ngreenfbdpmstgl liga isto sem o -ngreenxefix.
+	if (on < 0) on = ((xeFixEnabled() || checkKernelArgument("-ngreenfbdpmstgl")) && !checkKernelArgument("-ngreenfbdpms")) ? 1 : 0;
 	auto *fb = static_cast<uint8_t *>(that);
 	if (on && fb && NGreen::callback && *reinterpret_cast<uint32_t *>(fb + 0x1dc) == 0) {
 		uint32_t cur = *reinterpret_cast<uint32_t *>(fb + 0x4284);
