@@ -15,7 +15,7 @@ static uint64_t agdcT_AGDCEnableController(void *that, uint32_t *a);
 static uint64_t agdcT_GetStreamAssociation(void *that, uint32_t *a, uint32_t *b);
 static uint64_t agdcT_SetFbStatusOnNextProbe(void *that, uint32_t *a);
 static uint64_t agdcT_connectionChanged(void *that);
-static mach_vm_address_t gAgdcOrig[34] {};
+static mach_vm_address_t gAgdcOrig[35] {};
 static uint64_t agdcT_GetLinkConfig(void *that, uint32_t *a, uint32_t *b);
 static uint64_t agdcT_doLinkTraining(void *that, uint32_t *a, uint32_t *b);
 static uint64_t agdcT_AGDCInjectEvent(void *that, uint32_t *a);
@@ -39,6 +39,7 @@ static uint64_t fbT_hwSetStream(void *that, void *fb, void *path, void *t);
 static uint64_t fbT_disableDisplay(void *that, void *fb, void *path, uint8_t f);
 static uint64_t fbT_LightUpDP(void *that, void *fb, void *path, void *t);
 static uint64_t fbT_enableController(void *that, void *fb);
+static uint64_t fbT_hwRegsNeedUpdate(void *that, void *fb, void *path, void *crtc, void *t, void *sc);
 static bool hdmiEmuOn();
 static void hdmiEmuScheduleOutput();
 static void hdmiEmuEnableOutputNow();
@@ -1340,6 +1341,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN24AppleIntelBaseController14disableDisplayEP21AppleIntelFramebufferP21AppleIntelDisplayPathh", fbT_disableDisplay, gAgdcOrig[31]},
 			{"__ZN24AppleIntelBaseController9LightUpDPEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2", fbT_LightUpDP, gAgdcOrig[32]},
 			{"__ZN24AppleIntelBaseController16enableControllerEP21AppleIntelFramebuffer", fbT_enableController, gAgdcOrig[33]},
+			{"__ZN24AppleIntelBaseController16hwRegsNeedUpdateEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParamsPK29IODetailedTimingInformationV2PN16AppleIntelScaler12SCALERPARAMSE", fbT_hwRegsNeedUpdate, gAgdcOrig[34]},
 			{"__ZN24AppleIntelBaseController13GetLinkConfigEP16AGDCLinkConfig_tS1_", agdcT_GetLinkConfig, gAgdcOrig[12]},
 			{"__ZN24AppleIntelBaseController14doLinkTrainingEP18AGDCDPPortConfig_tS1_", agdcT_doLinkTraining, gAgdcOrig[13]},
 			{"__ZN24AppleIntelBaseController15AGDCInjectEventEP19AGDCFBInjectEvent_t", agdcT_AGDCInjectEvent, gAgdcOrig[14]},
@@ -4090,6 +4092,22 @@ static uint64_t fbT_LightUpDP(void *that, void *fb, void *path, void *t) {
 	uint32_t st0 = path ? getMember<uint32_t>(path, 0x3644) : 0xFFFF;
 	uint64_t r = reinterpret_cast<uint64_t (*)(void *, void *, void *, void *)>(gAgdcOrig[32])(that, fb, path, t);
 	fbTraceFb("LightUpDP", fb, path, r, st0);
+	return r;
+}
+// NP550 USB-C DP: no FB externo o hwRegsNeedUpdate responde "nada mudou" mesmo com o transcoder desligado, e o hwSetMode
+// pega o atalho (só enablePlane), sem SetupTimings/LightUpDP: o link nunca treina e o monitor fica apagado. Com o
+// transcoder do pipe desligado, força a reprogramação completa. (No HDMI emulado o pipe B já está aceso: segue o atalho.)
+static uint64_t fbT_hwRegsNeedUpdate(void *that, void *fb, void *path, void *crtc, void *t, void *sc) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, void *, void *, void *, void *, void *)>(gAgdcOrig[34])(that, fb, path, crtc, t, sc);
+	uint32_t idx = fb ? getMember<uint32_t>(fb, 0x1DC) : 0;
+	if (hdmiEmuOn() && !(r & 0xFF) && (idx == 1 || idx == 2) && !(gHdmiOutState == 2 && gHdmiEmuLinked)) {
+		uint32_t conf = NGreen::callback->readReg32(idx == 1 ? 0x71008 : 0x72008);
+		if (!(conf & 0x80000000u)) {
+			static int n = 0;
+			if (n++ < 10) IOLog("XeNG FBT hwRegsNeedUpdate fb%u: transcoder desligado (TRANS_CONF=%08x) -> reprogramar\n", idx, conf);
+			r = (r & ~0xFFull) | 1;
+		}
+	}
 	return r;
 }
 static uint64_t fbT_enableController(void *that, void *fb) {
