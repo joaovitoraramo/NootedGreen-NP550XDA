@@ -345,6 +345,18 @@ static void applyFixBootMode(KernelPatcher &patcher, KernelPatcher::KextInfo *ke
 	SYSLOG("ngreen", "fixbootmode: fCurrentMode initial 0xfffffffb -> 0x80001000 patch %s", gFbModePatchOk ? "applied" : "NOT found");
 }
 
+// NP550 HDMIEMU: hwDoGMBusRequest só aceita pinos GMBUS < 8 ("cmpl $0x8, -0x34(%rbp); jb", 0x7b55d no 16.0.32), mas o
+// DDC do HDMI legado na TC1 é o pino 9 (VBT DDC pin 4, i915 GMBUS_PIN_9_TC1_ICP). O pino vai direto para o GMBUS0, então
+// basta aceitar até 15: cmp $8 -> cmp $16.
+static void applyGmbusPinPatch(KernelPatcher &patcher, KernelPatcher::KextInfo *kext, mach_vm_address_t address, size_t size) {
+	if (!checkKernelArgument("-ngreenhdmiemu")) return;
+	static const uint8_t f[] = {0x83, 0x7d, 0xcc, 0x08, 0x72, 0x72};
+	static const uint8_t r[] = {0x83, 0x7d, 0xcc, 0x10, 0x72, 0x72};
+	LookupPatchPlus const p[] = {{kext, f, r, arrsize(f), 1}};
+	bool ok = LookupPatchPlus::applyAll(patcher, p, address, size);
+	SYSLOG("ngreen", "HDMIEMU: patch do limite de pino GMBUS (<8 -> <16) %s", ok ? "aplicado" : "NAO encontrado");
+}
+
 // xe/bootmode (-ngreenfixbootmode): o WindowServer abre o display pipe (IOAccelDisplayPipe::init_framebuffer_resource)
 // ~2 s antes de o FB receber a tabela de timings (fDetailedTimings, this+0x4260, setDetailedTimings). Sem a tabela
 // validateDisplayMode devolve 0xe00002c2 e o DisplayPipe não é criado. Aqui montamos a tabela cedo, com o timing que a
@@ -1627,6 +1639,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesp , address, size), "ngreen", "kextG11FBT Failed to apply production patches!");
 			applyFixBootMode(patcher, activeKext, address, size);
+			applyGmbusPinPatch(patcher, activeKext, address, size);
 			if (enableTcon) {
 				LookupPatchPlus const tconPatches[] = {
 					{activeKext, f_tcon_camellia, r_tcon_camellia, arrsize(f_tcon_camellia), 1},
@@ -1683,6 +1696,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patches , address, size), "ngreen", "kextG11FBT Failed to apply dbg patches!");
 			applyFixBootMode(patcher, activeKext, address, size);
+			applyGmbusPinPatch(patcher, activeKext, address, size);
 			if (enableTcon) {
 				LookupPatchPlus const tconPatches[] = {
 					{activeKext, f_tcon_camellia, r_tcon_camellia, arrsize(f_tcon_camellia), 1},
