@@ -4817,6 +4817,30 @@ static uint32_t xeFenceFilterWrite(uint32_t r, uint32_t val) {
 	if (r < 0x100000 || r >= 0x100100 || !(r & 4) || !NGreen::callback || !xeFenceClampOn()) return val;
 	return xeFenceClampHi(NGreen::callback->readReg32(r - 4) | 1, val);   // lo pode estar desligado durante a troca
 }
+// NP550 USB-C DP: a tabela de sinal da Apple para o PHY combo B (swing 6, N 0x7f, RTERM 0, cursor 0x18) deixa a lane 0
+// sem clock recovery no hub USB-C. Troca, na gravação, pelos valores que o i915 usa e que treinam HBR2 x2 neste
+// notebook (dump no Linux com o hub aceso): TX_DW2 0xa098, TX_DW4 0x28003f (+LOADGEN nas lanes 1-2), TX_DW5
+// 0x20290030 (+TX_TRAINING_EN da Apple), TX_DW7 N 0x47, PCS_DW1 sem DCC contínuo. Grupos (0x6C6xx) e lanes (0x6C8xx+).
+static uint32_t dpbPhyFix(uint32_t r, uint32_t val) {
+	if (r < 0x6C600 || r >= 0x6CC00) return val;
+	uint32_t off = r - 0x6C000;
+	bool grp = off < 0x800;
+	uint32_t ln = grp ? 0xFF : (off - 0x800) / 0x100;
+	uint32_t dw = grp ? (off & 0x7F) : (off & 0xFF);
+	bool tx = grp ? (off >= 0x680 && off < 0x700) : (dw >= 0x80);
+	bool pcs = grp ? (off >= 0x600 && off < 0x680) : (dw < 0x80);
+	uint32_t d = (dw & 0x7F) / 4;
+	uint32_t nv = val;
+	if (tx && d == 2) nv = (val & ~0xB8FFu) | 0xA098u;
+	else if (tx && d == 4) {
+		nv = (val & ~0x803FFFFFu) | 0x0028003Fu;
+		if (grp ? (val & 0x80000000u) : (ln == 1 || ln == 2)) nv |= 0x80000000u;
+	} else if (tx && d == 5) nv = (val & 0x80000000u) | 0x20290030u;
+	else if (tx && d == 7) nv = (val & ~0x7F000000u) | 0x47000000u;
+	else if (pcs && d == 1) nv = val & ~0x00300000u;
+	if (nv != val) { static int n = 0; if (n++ < 40) IOLog("XeNG DPB phy %05x %08x -> %08x\n", r, val, nv); }
+	return nv;
+}
 static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 	{
 		uint32_t r = (uint32_t)(reg & 0x1FFFFF);
@@ -4824,6 +4848,7 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 		val = xeFenceFilterWrite(r, val);
 		// NP550 HDMIOUT: com a saída HDMI acesa, o caminho DP da Apple desfaz o que não reconhece (desliga o buffer da DDI D,
 		// o IO da TC1...) e põe o DDB do pipe B por cima do pipe A e na fatia S2 desligada (underrun = faixas no painel).
+		if (gDpBLinked && hdmiEmuOn()) val = dpbPhyFix(r, val);
 		if (gHdmiOutState == 2 && hdmiEmuOn()) val = hdmiOutKeep(r, val);
 		// NP550 pipe B em qualquer saída externa (HDMI ou DP do USB-C): a Apple põe o DDB dos planos do pipe B por cima do
 		// pipe A e/ou na fatia S2 desligada (underrun = faixas no painel). Liga a S2 e move o DDB do pipe B para ela.
