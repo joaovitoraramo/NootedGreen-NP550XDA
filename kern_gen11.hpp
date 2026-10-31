@@ -1899,6 +1899,8 @@ private:
 	// V201 diagnostic: read first bytes of the scanout buffer right after hwSetupMemory
 	// returns. Tells us whether something filled the buffer (wallpaper) or it's still
 	// zeros from the IOBufferMemoryDescriptor allocation.
+	static void cursorDiag();   // NP550 -ngreencurdiag
+	static void cursorDiagStart();
 	static int wrapHwSetupMemory(AppleIntel::AppleIntelBaseController *that, AppleIntel::AppleIntelFramebuffer *fb, AppleIntel::AppleIntelDisplayPath *displayPath, AppleIntel::CRTCParams *params, bool isAperture);
 	mach_vm_address_t ohwSetupMemory {};
 

@@ -3792,6 +3792,53 @@ static void xeBootDiagDump(const char *tag) {
 	if (gXeBdN > (SInt32)arrsize(gXeBd)) IOLog("XeNG BOOTDIAG %s ring full (%d writes)\n", tag, (int)gXeBdN);
 }
 
+// NP550 cursor diag (-ngreencurdiag): the hardware cursor shows as 4 stacked copies on real TGL. Every 20 s
+// (t+60..t+640) dump the cursor registers, the GGTT PTEs of its pages and (a few times) its alpha channel read back
+// through the aperture, i.e. through the same GGTT the display engine uses.
+void Gen11::cursorDiag() {
+	if (!NGreen::callback || !NGreen::callback->mmioValid()) return;
+	static int n = 0, imgs = 0; static uint32_t lastBase = 0xFFFFFFFF, lastCtl = 0xFFFFFFFF;
+	n++;
+	#define R(a) NGreen::callback->readReg32(a)
+	uint32_t ctl = R(0x70080), base = R(0x70084), pos = R(0x70088), fbc = R(0x700A0), live = R(0x700AC);
+	IOLog("XeNG CURDIAG #%d CTL=%08x BASE=%08x POS=%08x FBC=%08x LIVE=%08x PLANE_CTL=%08x STRIDE=%08x\n", n, ctl, base, pos, fbc, live, R(0x70180), R(0x70188));
+	uint32_t mode = ctl & 0x27, dim = mode == 0x23 ? 256 : mode == 0x22 ? 128 : 64;
+	if (base && (base != lastBase || ctl != lastCtl)) {
+		for (uint32_t i = 0; i < dim * dim * 4 / 4096 && i < 16; i++)
+			IOLog("XeNG CURDIAG #%d PTE[%x]=%08x:%08x\n", n, (base >> 12) + i, R(GGTT_PTE_HI((base >> 12) + i)), R(GGTT_PTE_LO((base >> 12) + i)));
+	}
+	#undef R
+	if (base && mode && imgs < 4 && (base != lastBase || ctl != lastCtl || n % 6 == 0)) {
+		NGreen::callback->setApertureIfNecessary();
+		if (NGreen::callback->aperturePtr && base + dim * dim * 4 <= NGreen::callback->apertureLen) {
+			imgs++;
+			volatile UInt32 *c = NGreen::callback->aperturePtr + base / 4;
+			uint32_t step = dim / 64;
+			char line[65];
+			for (uint32_t y = 0; y < dim; y += step) {
+				for (uint32_t x = 0; x < 64; x++) {
+					uint32_t a = c[y * dim + x * step] >> 24;
+					line[x] = a == 0 ? '.' : a >= 0x80 ? '#' : '+';
+				}
+				line[64] = 0;
+				IOLog("XeNG CURIMG #%d y=%03u %s\n", n, y, line);
+			}
+		}
+	}
+	lastBase = base; lastCtl = ctl;
+}
+static thread_call_t gXeCurTimer = nullptr;
+void Gen11::cursorDiagStart() {
+	if (gXeCurTimer) return;
+	gXeCurTimer = thread_call_allocate([](thread_call_param_t, thread_call_param_t) {
+		static int ticks = 0;
+		Gen11::cursorDiag();
+		if (++ticks < 30) { uint64_t d; clock_interval_to_deadline(20, kSecondScale, &d); thread_call_enter_delayed(gXeCurTimer, d); }
+	}, nullptr);
+	uint64_t d; clock_interval_to_deadline(60, kSecondScale, &d);
+	if (gXeCurTimer) thread_call_enter_delayed(gXeCurTimer, d);
+}
+
 static thread_call_t gXeBhTimer = nullptr;
 static void xeBootHoldRelease(const char *why) {   // write Apple's last CTL, re-arm with the current SURF, backlight back on
 	if (gXeBhDone) return;
@@ -5062,6 +5109,7 @@ bool Gen11::AppleIntelBaseControllerstart(AppleIntel::AppleIntelBaseController *
 			uint64_t d10, d40; clock_interval_to_deadline(10, kSecondScale, &d10); clock_interval_to_deadline(40, kSecondScale, &d40);
 			if (tc10) thread_call_enter_delayed(tc10, d10);
 			if (tc40) thread_call_enter_delayed(tc40, d40);
+			if (checkKernelArgument("-ngreencurdiag")) cursorDiagStart();
 		}
 	}
 	
