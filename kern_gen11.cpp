@@ -17,6 +17,9 @@ static uint64_t agdcT_SetFbStatusOnNextProbe(void *that, uint32_t *a);
 static uint64_t agdcT_connectionChanged(void *that);
 static mach_vm_address_t gAgdcOrig[12] {};
 static bool hdmiEmuOn();
+static bool hdmiEmuPort(void *that);
+static void hdmiEmuPowerTc1(const char *why);
+static uint32_t hdmiEmuGmbusRead(uint32_t pin, uint32_t offset, uint8_t *buf, uint32_t len);
 static volatile uint32_t gGmbusPin = 0;   // NP550 HDMIEMU: pino do pedido GMBUS em curso (o FB não grava o GMBUS0)
 #include "AppleIntelParams.hpp"
 #include <Headers/kern_api.hpp>
@@ -3489,6 +3492,17 @@ uint64_t Gen11::wrapHalSetPortMode(void *that, uint32_t mode) {
 	return r;
 }
 uint64_t Gen11::wrapPortGetDDCBlock(void *that, uint32_t block, uint8_t *buf, bool flag) {
+	// NP550 HDMIEMU: a sequência GMBUS da Apple não funciona no pino 9 (TC1); a leitura própria (i915) funciona. Bloco
+	// 1-based de 128 bytes, offset (block-1)*128 (EDID de até 2 blocos sem segment pointer).
+	if (hdmiEmuPort(that) && buf && block >= 1 && block <= 2) {
+		hdmiEmuPowerTc1("ddc");
+		uint32_t st = hdmiEmuGmbusRead(9, (block - 1) * 128, buf, 128);
+		bool ok = (st >> 24) == 128;
+		static int n = 0;
+		if (n++ < 20) IOLog("XeNG HDMIEMU EDID bloco %u: %s GMBUS2=%06x [%02x %02x .. 8:%02x%02x 126:%02x]\n", block, ok ? "OK" : "FALHOU",
+							st & 0xFFFFFF, buf[0], buf[1], buf[8], buf[9], buf[126]);
+		if (ok) return kIOReturnSuccess;
+	}
 	uint64_t r = FunctionCast(wrapPortGetDDCBlock, callback->oPortGetDDCBlock)(that, block, buf, flag);
 	HPDLOG(n, "XeNG HPD getDDCBlock ddi=%u mode=%u block=%u flag=%d ret=0x%llx edid=%02x%02x%02x%02x\n", hpdDdi(that),
 		   that ? getMember<uint32_t>(that, 0x550) : 0, block, flag, r, buf ? buf[0] : 0, buf ? buf[1] : 0, buf ? buf[8] : 0, buf ? buf[9] : 0);
@@ -3544,20 +3558,20 @@ static void hdmiEmuPowerTc1(const char *why) {
 }
 // NP550 HDMIEMU: leitura DDC própria (como o i915 gmbus_xfer_read com índice): 8 bytes do endereço 0x50, offset 0,
 // para separar "sequência da Apple" de "barramento morto". Devolve o GMBUS2 final e preenche buf.
-static uint32_t hdmiEmuGmbusProbe(uint32_t pin, uint8_t *buf) {
+static uint32_t hdmiEmuGmbusRead(uint32_t pin, uint32_t offset, uint8_t *buf, uint32_t len) {
 	auto rd = [](uint32_t r) { return NGreen::callback->readReg32(r); };
 	auto wr = [](uint32_t r, uint32_t v) { NGreen::callback->writeReg32(r, v); };
 	const uint32_t G0 = 0xC5100, G1 = 0xC5104, G2 = 0xC5108, G3 = 0xC510C, G5 = 0xC5120;
 	wr(G1, 1u << 31); wr(G1, 0);   // SW_CLR_INT
 	wr(G0, pin); wr(G5, 0);
-	wr(G1, (1u << 30) | (1u << 26) | (1u << 25) | (8u << 16) | (0u << 8) | (0x50u << 1) | 1u);
-	uint32_t st = 0; int got = 0;
-	while (got < 8) {
+	wr(G1, (1u << 30) | (1u << 26) | (1u << 25) | ((len & 0x1FF) << 16) | ((offset & 0xFF) << 8) | (0x50u << 1) | 1u);
+	uint32_t st = 0; uint32_t got = 0;
+	while (got < len) {
 		int i = 0;
 		for (; i < 2000; i++) { st = rd(G2); if (st & ((1u << 11) | (1u << 10))) break; IODelay(10); }
 		if (!(st & (1u << 11)) || (st & (1u << 10))) break;
 		uint32_t v = rd(G3);
-		for (int k = 0; k < 4 && got < 8; k++) buf[got++] = (v >> (8 * k)) & 0xFF;
+		for (int k = 0; k < 4 && got < len; k++) buf[got++] = (v >> (8 * k)) & 0xFF;
 	}
 	wr(G1, (1u << 30) | (1u << 27));   // STOP
 	for (int i = 0; i < 1000 && (rd(G2) & (1u << 9)); i++) IODelay(10);
@@ -3570,14 +3584,14 @@ static void hdmiEmuGmbusScan() {
 	static const uint32_t pins[] = {9, 1, 2, 3, 10, 11, 12, 13, 14};
 	for (uint32_t pin : pins) {
 		uint8_t b[8] = {};
-		uint32_t r = hdmiEmuGmbusProbe(pin, b);
+		uint32_t r = hdmiEmuGmbusRead(pin, 0, b, 8);
 		IOLog("XeNG HDMIEMU scan pin=%u got=%u GMBUS2=%06x edid=%02x %02x %02x %02x %02x %02x %02x %02x\n", pin, r >> 24, r & 0xFFFFFF,
 			  b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
 	}
 }
 uint64_t Gen11::wrapGMBusRequest(void *that, uint32_t pin, uint32_t x, void *req) {
 	bool emu = pin == 9 && hdmiEmuOn();
-	if (emu) { hdmiEmuPowerTc1("gmbus"); hdmiEmuGmbusScan(); gGmbusPin = pin; }
+	if (emu) { hdmiEmuPowerTc1("gmbus"); gGmbusPin = pin; }
 	uint64_t r = FunctionCast(wrapGMBusRequest, callback->oGMBusRequest)(that, pin, x, req);
 	if (emu) gGmbusPin = 0;
 	HPDLOG(n, "XeNG HPD GMBus pin=%u x=%u ret=0x%llx GMBUS0=%08x GMBUS2=%08x\n", pin, x, r,
