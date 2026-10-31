@@ -1564,6 +1564,8 @@ private:
 	static uint64_t wrapHasDDCConnect(void *that, int conn);
 	static uint64_t wrapProbePortState(void *that);
 	static uint64_t wrapGetHPDState(void *that);
+	static uint64_t wrapCallBackAGDC(void *that, uint32_t event, unsigned long arg, uint32_t port);
+	mach_vm_address_t oCallBackAGDC {};
 	static uint64_t wrapIsHPDLow(void *that);
 	mach_vm_address_t oGetHPDState {}, oIsHPDLow {};
 	mach_vm_address_t oInvokeHotplug {}, oHalSetPortMode {}, oPortGetDDCBlock {}, oGMBusRequest {}, oHasDDCConnect {}, oProbePortState {};
