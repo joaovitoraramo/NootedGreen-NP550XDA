@@ -3879,7 +3879,12 @@ static void hdmiEmuEnableOutput() {
 		dklWrite(ln, 0x2C0, 0x10000007);   // TX_DPCNTL0
 		dklWrite(ln, 0x2C4, 0x10000007);   // TX_DPCNTL1
 		dklWrite(ln, 0x2C8, 0x00000000);   // TX_DPCNTL2
+		dklWrite(ln, 0xD00, 0x00000000);   // TX_PMD_LANE_SUS: lanes ativas (no macOS ficavam 0xc = suspensas, sem sinal)
 	}
+	// diferenças restantes contra o Linux (dump completo do PHY, 31/10)
+	dklWrite(1, 0xD74, 0x00000002);
+	dklWrite(0, 0x0C0, 0x00005FFF);
+	dklWrite(0, 0x0C4, 0x00000300);
 	// 4b. DBUF: fatia S2 ligada e DDB do pipe B dentro dela (a Apple o põe por cima do pipe A)
 	wr(0x44FE8, rd(0x44FE8) | 0x80000000u);
 	bool s2 = waitBits(0x44FE8, 0x40000000u, 0x40000000u, 10000);
@@ -3890,7 +3895,7 @@ static void hdmiEmuEnableOutput() {
 	wr(0x6100C, 0x04640437); wr(0x61010, 0x04640437); wr(0x61014, 0x0440043B);
 	wr(0x71030, 0x00800100);
 	wr(0x61400, 0xA0330000);
-	wr(0x71008, rd(0x71008) | 0x80000000u);
+	wr(0x71008, (rd(0x71008) & ~0xFCu) | 0x80000000u);   // sem o 10 bpc + dither que a Apple põe (Linux: 0xc0000000)
 	bool tr = waitBits(0x71008, 1u << 30, 1u << 30, 50000);
 	// 6. buffer da DDI D; regravar a superfície do plano B trava (latch) o novo DDB
 	wr(0x64300, 0x80000000);
@@ -3947,6 +3952,7 @@ static uint32_t hdmiOutKeep(uint32_t r, uint32_t val) {
 		case 0x45444: nv = val | 0x80; break;                    // AUX da TC1 (DDC/HPD)
 		case 0x1638C0: nv = (val & ~0xFu) | 0xF; break;          // FIA: 4 lanes na TC1
 		case 0x44FE8: nv = val | 0x80000000u; break;             // DBUF fatia S2 ligada
+		case 0x71008: nv = val & ~0xFCu; break;                  // TRANS_CONF B sem bpc/dither do DP
 		case 0x7127C: case 0x7137C: nv = hdmiOutRemapBuf(val); break;   // DDB dos planos do pipe B na S2
 		default: return val;
 	}
