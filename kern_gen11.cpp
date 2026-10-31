@@ -1258,6 +1258,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN14AppleIntelPort21setupOptimalLaneCountEPK29IODetailedTimingInformationV2j",setupOptimalLaneCount, this->osetupOptimalLaneCount},
 			// V97: Log AUX transactions to diagnose eDP link training failures on RPL
 			{"__ZN14AppleIntelPort7readAUXEjPvj", wrapICLReadAUX, this->orgICLReadAUX},
+			// NP550 (-ngreenauxtrace): quem chama o AUX nas portas sem DP (HDMI legado na TC1 = ddi 3).
+			{"__ZN17AppleIntelPortHAL13runAUXCommandEN14AppleIntelPort11AUX_CommandEPjjb", wrapRunAUXCommand, this->oRunAUXCommand},
 			// V96: Force display online — WEG's getDisplayStatus hook (FOD) fails with
 			// "err 2" on TGL kext because that symbol doesn't exist. TGL uses getOnlineInfo.
 			{"__ZN21AppleIntelFramebuffer13getOnlineInfoEP21AppleIntelDisplayPathPhS2_", getOnlineInfo, this->ogetOnlineInfo},
@@ -3414,6 +3416,31 @@ void Gen11::setupOptimalLaneCount(AppleIntel::AppleIntelBaseController *that, co
 
 	if (hwLanes > cached)
 		cached = hwLanes;
+}
+
+// NP550 AUXTRACE (-ngreenauxtrace): pilha de quem chama runAUXCommand nas ddi 3 (HDMI TC1) e 7, em offsets do
+// binário do FB (slide calculado por _gPlatformInformationList, estático 0x%llx em ngreenauxbase=...).
+IOReturn Gen11::wrapRunAUXCommand(void *that, uint32_t cmd, uint32_t *data, uint32_t len, bool flag) {
+	static int on = -1;
+	if (on < 0) on = checkKernelArgument("-ngreenauxtrace") ? 1 : 0;
+	if (on && that) {
+		auto *cfg = getMember<uint32_t *>(that, 0x548);
+		uint32_t ddi = cfg ? cfg[0] : 0xFF;
+		static int n3 = 0, n7 = 0;
+		int *n = ddi == 3 ? &n3 : ddi == 7 ? &n7 : nullptr;
+		if (n && *n < 3) {
+			(*n)++;
+			uint64_t base = 0;
+			PE_parse_boot_argn("ngreenauxbase", &base, sizeof(base));
+			uint64_t slide = base ? (uint64_t)callback->gPlatformInformationList - base : 0;
+			void *bt[14] = {};
+			unsigned cnt = OSBacktrace(bt, 14);
+			IOLog("XeNG AUXTRACE ddi=%u #%d cmd=0x%x len=%u mode=%u slide=0x%llx\n", ddi, *n, cmd, len, getMember<uint32_t>(that, 0x550), slide);
+			for (unsigned i = 0; i < cnt; i++)
+				IOLog("XeNG AUXTRACE ddi=%u #%d  [%u] 0x%llx\n", ddi, *n, i, slide ? (uint64_t)bt[i] - slide : (uint64_t)bt[i]);
+		}
+	}
+	return FunctionCast(wrapRunAUXCommand, callback->oRunAUXCommand)(that, cmd, data, len, flag);
 }
 
 IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint32_t length) {
