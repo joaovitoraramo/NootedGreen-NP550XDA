@@ -3856,8 +3856,12 @@ static uint32_t xeBootHold(unsigned long reg, uint32_t val) {
 static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 	xeBootDiagRecord(reg, val);
 	val = xeBootHold(reg, val);
-	if (!xeFixEnabled()) return val;
-	val = xeNoDpms((uint32_t)(reg & 0x1FFFFF), val);
+	// NP550XDA: o XE-BLR (brilho) sozinho, sem o resto do -ngreenxefix (ajustes de Alder Lake/display 13).
+	static int blrOnly = -1;
+	if (blrOnly < 0) blrOnly = checkKernelArgument("-ngreenblr") ? 1 : 0;
+	const bool xeFix = xeFixEnabled();
+	if (!xeFix && !blrOnly) return val;
+	if (xeFix) val = xeNoDpms((uint32_t)(reg & 0x1FFFFF), val);
 	// 20/10 (XE-BLR): o brilho ia só até ~50%. Como o BacklightRegistersFix do WhateverGreen: mantém o período do
 	// hardware (lido antes da 1ª escrita da Apple) e reescala o duty por período_hw / período_Apple. Se a Apple não
 	// gravar o período, ngreenblmax=N diz qual duty ela considera 100%. -ngreennoblr desliga.
@@ -3883,6 +3887,7 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 			}
 		}
 	}
+	if (!xeFix) return val;   // -ngreenblr sozinho: nada de DBUF/GAMMA/etc. do display 13
 	switch (reg & 0xFFFFF) {
 		case 0x44FE8: if (!(val & 0x80000000u)) { static int n = 0; if (n++ < 8) IOLog("XeNG xefix: DBUF_CTL_S1 0x%x -> power on\n", val); } return val | 0x80000000u;
 		case 0x42084: return val | 0x40000000u;
