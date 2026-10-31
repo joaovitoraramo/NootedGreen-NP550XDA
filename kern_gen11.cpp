@@ -30,6 +30,7 @@ static uint64_t agdcT_getDisplayPipeCapability(void *that, uint32_t *a, uint32_t
 static uint64_t agdcT_releaseResourceConfigurationSet(void *that, uint32_t *a);
 static uint64_t agdcT_getDisplayPipeCapabilityExtended(void *that, uint32_t *a, uint32_t *b);
 static uint64_t agdcT_FBSetEDID(void *that, uint32_t *a);
+static constexpr uint32_t kHdmiEmuDdi = 3;   // NP550 HDMIEMU: HDMI legado na TC1 (porta AGDC 4)
 static bool hdmiEmuOn();
 static bool hdmiEmuPort(void *that);
 static void hdmiEmuPowerTc1(const char *why);
@@ -3734,6 +3735,13 @@ static uint64_t agdcT_GetLinkConfig(void *that, uint32_t *a, uint32_t *b) {
 }
 static uint64_t agdcT_doLinkTraining(void *that, uint32_t *a, uint32_t *b) {
 	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *, uint32_t *)>(gAgdcOrig[13])(that, a, b);
+	// NP550 HDMIEMU: na porta AGDC 4 (ddi 3, HDMI legado) não existe link DP para treinar; o original programa o PHY em DP
+	// e falha ao conferir o hardware. Responde sucesso para o AGDC seguir para o modeset (Fase B: modeset em HDMI).
+	if (hdmiEmuOn() && a && a[0] == kHdmiEmuDdi + 1 && (r & 0xFFFFFFFF)) {
+		static int n = 0;
+		if (n++ < 10) IOLog("XeNG HDMIEMU doLinkTraining porta %u: original 0x%llx -> sucesso emulado\n", a[0], r & 0xFFFFFFFF);
+		r = 0;
+	}
 	HPDLOG(n, "XeNG AGDC doLinkTraining in=%08x %08x %08x %08x out=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0,
 		   b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, r & 0xFFFFFFFF);
 	return r;
@@ -3832,7 +3840,7 @@ IOReturn Gen11::wrapRunAUXCommand(void *that, uint32_t cmd, uint32_t *data, uint
 // o DPCD por AUX (timeout) e nunca pede o EDID. Aqui a ddi 3 vira um "sink DP 1.2" emulado: leituras AUX nativas vêm
 // de um DPCD sintético, escritas ficam guardadas nele, e o treinamento aparece sempre concluído. O EDID continua
 // pelo getDDCBlock -> GMBUS (ngreencon3pipe=2). Fase A: só fazer o AGDC avançar; o sinal HDMI vem depois.
-static constexpr uint32_t kHdmiEmuDdi = 3;
+
 static uint8_t gEmuDpcd[0x2300];
 static bool gEmuInit = false;
 static bool hdmiEmuOn() { static int on = -1; if (on < 0) on = checkKernelArgument("-ngreenhdmiemu") ? 1 : 0; return on == 1; }
