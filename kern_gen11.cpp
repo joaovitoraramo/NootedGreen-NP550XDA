@@ -49,7 +49,7 @@ static bool hdmiColorTest();
 static volatile uint32_t gHdmiOutState = 0;   // NP550 HDMIEMU: 0 nada, 1 agendado/em curso, 2 aceso
 static volatile bool gHdmiEmuLinked = false;   // NP550: o AGDC treinou a porta 4 (HDMI); sem isso o pipe B é de outra porta (USB-C)
 static volatile bool gDpBLinked = false;       // NP550: o AGDC treinou a porta 2 (DDI B, DP do USB-C) neste boot
-static void * volatile gDpBForceFb = nullptr;   // NP550: FB externo cujo hwSetMode em curso deve fazer modeset completo     // NP550: _gSysctlVariables do FB TGL (+0x120 != 0 força modeset completo)
+static void * volatile gDpBForceFb = nullptr;   // NP550: FB externo cujo hwSetMode em curso deve fazer modeset completo
 static volatile bool gPipeBDbufFix = false;    // NP550: DDB do pipe B já foi para a fatia S2 (vale para HDMI e USB-C)
 static bool hdmiEmuPort(void *that);
 static void hdmiEmuPowerTc1(const char *why);
