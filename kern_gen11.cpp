@@ -1728,8 +1728,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				//{activeKext, f4c, r4c, arrsize(f4c),	2},
 		//		{activeKext, f6a, r6a, arrsize(f6a),	1},
 		//		{activeKext, f7, r7, arrsize(f7),	1},
-				// f10 ("hwreg" CALL+JZ→JMP bypass) commented out — NOT in NootedBlue.
-				{activeKext, f10, r10, arrsize(f10),	1},
+				// f10 ("hwreg" CALL+JZ→JMP bypass): hwSetMode nunca faz modeset completo. No NP550 (-ngreenhdmiemu) sai daqui
+				// e vira regra no Gen11::hwRegsNeedUpdate: mesmo efeito no eDP, mas o FB externo do USB-C pode treinar o DP.
+				// (aplicado logo abaixo, só sem -ngreenhdmiemu; count 0 no Lilu = todas as ocorrências)
 				// f13: mandatory. Without this port-probe bypass the spoofed TGL path freezes during boot.
 				{activeKext, f13, r13, arrsize(f13),	1},
 				// f13b: mandatory. Without this bypass AppleIntelPort::probePortStateEv hits
@@ -1756,6 +1757,10 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				};
 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patches , address, size), "ngreen", "kextG11FBT Failed to apply dbg patches!");
+			if (!hdmiEmuOn()) {
+				LookupPatchPlus const hwregPatch[] = {{activeKext, f10, r10, arrsize(f10), 1}};
+				PANIC_COND(!LookupPatchPlus::applyAll(patcher, hwregPatch, address, size), "ngreen", "kextG11FBT Failed to apply hwreg patch!");
+			}
 			applyFixBootMode(patcher, activeKext, address, size);
 			applyGmbusPinPatch(patcher, activeKext, address, size);
 			if (enableTcon) {
@@ -6290,11 +6295,15 @@ uint8_t Gen11::hwRegsNeedUpdate
 		uint32_t fi = getMember<uint32_t>(param_1, 0x1DC);
 		if (fi != 0 && nAll++ < 20) IOLog("XeNG DPB hwRegsNeedUpdate fb%u -> %u (marcado=%d)\n", fi, need, gDpBForceFb == (void *)param_1);
 	}
-	// NP550 USB-C DP: FB externo marcado pelo fbT_hwSetMode (transcoder desligado após hotplug na porta 2) -> modeset completo.
-	if (!need && gDpBForceFb && param_1 == gDpBForceFb) {
-		static int n = 0;
-		if (n++ < 10) IOLog("XeNG DPB hwRegsNeedUpdate: FB externo com transcoder desligado -> reprogramar\n");
-		need = 1;
+	// NP550: sem o patch f10 (JZ->JMP), a regra fica aqui. Todo FB segue como antes ("nada a reprogramar" -> só atualiza
+	// plano/scaler), menos o FB externo marcado pelo fbT_hwSetMode (USB-C com transcoder desligado): modeset completo.
+	if (hdmiEmuOn()) {
+		if (gDpBForceFb && param_1 == gDpBForceFb) {
+			static int n = 0;
+			if (n++ < 10) IOLog("XeNG DPB hwRegsNeedUpdate: FB externo com transcoder desligado -> modeset completo (original %u)\n", need);
+			return 1;
+		}
+		return 0;
 	}
 	return need;
 }
