@@ -1260,6 +1260,12 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN14AppleIntelPort7readAUXEjPvj", wrapICLReadAUX, this->orgICLReadAUX},
 			// NP550 (-ngreenauxtrace): quem chama o AUX nas portas sem DP (HDMI legado na TC1 = ddi 3).
 			{"__ZN17AppleIntelPortHAL13runAUXCommandEN14AppleIntelPort11AUX_CommandEPjjb", wrapRunAUXCommand, this->oRunAUXCommand},
+			{"__ZN24AppleIntelBaseController20invokeHotplugHandlerEjN14AppleIntelPort8PortModeE", wrapInvokeHotplug, this->oInvokeHotplug},
+			{"__ZN17AppleIntelPortHAL11setPortModeEN14AppleIntelPort8PortModeE", wrapHalSetPortMode, this->oHalSetPortMode},
+			{"__ZN14AppleIntelPort11getDDCBlockEjPhb", wrapPortGetDDCBlock, this->oPortGetDDCBlock},
+			{"__ZN24AppleIntelBaseController16hwDoGMBusRequestEjjP12IOI2CRequest", wrapGMBusRequest, this->oGMBusRequest},
+			{"__ZN21AppleIntelFramebuffer13hasDDCConnectEi", wrapHasDDCConnect, this->oHasDDCConnect},
+			{"__ZN14AppleIntelPort14probePortStateEv", wrapProbePortState, this->oProbePortState},
 			// V96: Force display online — WEG's getDisplayStatus hook (FOD) fails with
 			// "err 2" on TGL kext because that symbol doesn't exist. TGL uses getOnlineInfo.
 			{"__ZN21AppleIntelFramebuffer13getOnlineInfoEP21AppleIntelDisplayPathPhS2_", getOnlineInfo, this->ogetOnlineInfo},
@@ -3416,6 +3422,48 @@ void Gen11::setupOptimalLaneCount(AppleIntel::AppleIntelBaseController *that, co
 
 	if (hwLanes > cached)
 		cached = hwLanes;
+}
+
+// NP550 HPDTRACE (-ngreenhpdtrace): argumentos e retorno de cada passo do hotplug; ddi da porta = (*(this+0x548))[0],
+// modo da porta = this+0x550. Limitado a 40 linhas por função.
+static bool hpdTraceOn() { static int on = -1; if (on < 0) on = checkKernelArgument("-ngreenhpdtrace") ? 1 : 0; return on == 1; }
+static uint32_t hpdDdi(void *port) { auto *c = port ? getMember<uint32_t *>(port, 0x548) : nullptr; return c ? c[0] : 0xFF; }
+#define HPDLOG(cnt, ...) do { static int cnt = 0; if (hpdTraceOn() && cnt++ < 40) IOLog(__VA_ARGS__); } while (0)
+uint64_t Gen11::wrapInvokeHotplug(void *that, uint32_t port, uint32_t mode) {
+	HPDLOG(n0, "XeNG HPD invokeHotplug port=%u mode=%u enter\n", port, mode);
+	uint64_t r = FunctionCast(wrapInvokeHotplug, callback->oInvokeHotplug)(that, port, mode);
+	HPDLOG(n1, "XeNG HPD invokeHotplug port=%u mode=%u -> 0x%llx\n", port, mode, r);
+	return r;
+}
+uint64_t Gen11::wrapHalSetPortMode(void *that, uint32_t mode) {
+	uint32_t before = that ? getMember<uint32_t>(that, 0x550) : 0;
+	uint64_t r = FunctionCast(wrapHalSetPortMode, callback->oHalSetPortMode)(that, mode);
+	HPDLOG(n, "XeNG HPD setPortMode ddi=%u %u -> %u ret=0x%llx DFLEXDPPMS=%08x CSSS=%08x\n", hpdDdi(that), before, mode, r,
+		   NGreen::callback->readReg32(0x163890), NGreen::callback->readReg32(0x163894));
+	return r;
+}
+uint64_t Gen11::wrapPortGetDDCBlock(void *that, uint32_t block, uint8_t *buf, bool flag) {
+	uint64_t r = FunctionCast(wrapPortGetDDCBlock, callback->oPortGetDDCBlock)(that, block, buf, flag);
+	HPDLOG(n, "XeNG HPD getDDCBlock ddi=%u mode=%u block=%u flag=%d ret=0x%llx edid=%02x%02x%02x%02x\n", hpdDdi(that),
+		   that ? getMember<uint32_t>(that, 0x550) : 0, block, flag, r, buf ? buf[0] : 0, buf ? buf[1] : 0, buf ? buf[8] : 0, buf ? buf[9] : 0);
+	return r;
+}
+uint64_t Gen11::wrapGMBusRequest(void *that, uint32_t pin, uint32_t x, void *req) {
+	uint64_t r = FunctionCast(wrapGMBusRequest, callback->oGMBusRequest)(that, pin, x, req);
+	HPDLOG(n, "XeNG HPD GMBus pin=%u x=%u ret=0x%llx GMBUS0=%08x GMBUS2=%08x\n", pin, x, r,
+		   NGreen::callback->readReg32(0xC5100), NGreen::callback->readReg32(0xC5108));
+	return r;
+}
+uint64_t Gen11::wrapHasDDCConnect(void *that, int conn) {
+	uint64_t r = FunctionCast(wrapHasDDCConnect, callback->oHasDDCConnect)(that, conn);
+	HPDLOG(n, "XeNG HPD hasDDCConnect fb=%p conn=%d -> 0x%llx\n", that, conn, r);
+	return r;
+}
+uint64_t Gen11::wrapProbePortState(void *that) {
+	uint64_t r = FunctionCast(wrapProbePortState, callback->oProbePortState)(that);
+	HPDLOG(n, "XeNG HPD probePortState ddi=%u mode=%u -> 0x%llx SDEISR=%08x\n", hpdDdi(that), that ? getMember<uint32_t>(that, 0x550) : 0, r,
+		   NGreen::callback->readReg32(0xC4000));
+	return r;
 }
 
 // NP550 AUXTRACE (-ngreenauxtrace): pilha de quem chama runAUXCommand nas ddi 3 (HDMI TC1) e 7, em offsets do

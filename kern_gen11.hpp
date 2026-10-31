@@ -1556,6 +1556,14 @@ private:
 	static IOReturn wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint32_t length);
 	static IOReturn wrapRunAUXCommand(void *that, uint32_t cmd, uint32_t *data, uint32_t len, bool flag);   // NP550 AUXTRACE
 	mach_vm_address_t oRunAUXCommand {};
+	// NP550 HPDTRACE (-ngreenhpdtrace): cadeia do hotplug do HDMI legado (TC1)
+	static uint64_t wrapInvokeHotplug(void *that, uint32_t port, uint32_t mode);
+	static uint64_t wrapHalSetPortMode(void *that, uint32_t mode);
+	static uint64_t wrapPortGetDDCBlock(void *that, uint32_t block, uint8_t *buf, bool flag);
+	static uint64_t wrapGMBusRequest(void *that, uint32_t pin, uint32_t x, void *req);
+	static uint64_t wrapHasDDCConnect(void *that, int conn);
+	static uint64_t wrapProbePortState(void *that);
+	mach_vm_address_t oInvokeHotplug {}, oHalSetPortMode {}, oPortGetDDCBlock {}, oGMBusRequest {}, oHasDDCConnect {}, oProbePortState {};
 	mach_vm_address_t orgICLReadAUX {};
 	
 	static int blit3d_supported();
