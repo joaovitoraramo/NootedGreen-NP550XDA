@@ -4216,7 +4216,18 @@ IOReturn Gen11::wrapWriteAUX(void *that, uint32_t address, void *buffer, uint32_
 		if (n++ < 60) IOLog("XeNG HDMIEMU writeAUX 0x%05x len=%u [0]=%02x [1]=%02x\n", address, length, b && length ? b[0] : 0, b && length > 1 ? b[1] : 0);
 		return kIOReturnSuccess;
 	}
-	return FunctionCast(wrapWriteAUX, callback->oWriteAUX)(that, address, buffer, length);
+	IOReturn ret = FunctionCast(wrapWriteAUX, callback->oWriteAUX)(that, address, buffer, length);
+	// NP550 DPB: treino do link do USB-C (DDI B) falha na fase 1 (clock recovery). Escritas DPCD + estado da DDI B.
+	auto *cfg = (that && hpdTraceOn()) ? getMember<uint32_t *>(that, 0x548) : nullptr;
+	if (cfg && cfg[0] == 1) {
+		auto *b = reinterpret_cast<uint8_t *>(buffer);
+		static int n = 0;
+		if (n++ < 80) IOLog("XeNG DPB writeAUX 0x%05x len=%u %02x %02x %02x %02x -> 0x%x | DDI_BUF_B=%08x DP_TP_CTL_B=%08x DP_TP_ST_B=%08x CLKA=%08x PWR=%08x\n",
+							address, length, b && length ? b[0] : 0, b && length > 1 ? b[1] : 0, b && length > 2 ? b[2] : 0, b && length > 3 ? b[3] : 0, ret,
+							NGreen::callback->readReg32(0x64100), NGreen::callback->readReg32(0x61540), NGreen::callback->readReg32(0x61544),
+							NGreen::callback->readReg32(0x164280), NGreen::callback->readReg32(0x45454));
+	}
+	return ret;
 }
 
 IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint32_t length) {
@@ -4232,6 +4243,16 @@ IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint3
 	}
 
 	IOReturn retVal = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that, address, buffer, length);
+	{
+		auto *cfg = (that && hpdTraceOn()) ? getMember<uint32_t *>(that, 0x548) : nullptr;
+		if (cfg && cfg[0] == 1) {
+			auto *b = reinterpret_cast<uint8_t *>(buffer);
+			static int n = 0;
+			if (n++ < 120) IOLog("XeNG DPB readAUX 0x%05x len=%u -> 0x%x: %02x %02x %02x %02x %02x %02x %02x %02x\n", address, length, retVal,
+								 b && length ? b[0] : 0, b && length > 1 ? b[1] : 0, b && length > 2 ? b[2] : 0, b && length > 3 ? b[3] : 0,
+								 b && length > 4 ? b[4] : 0, b && length > 5 ? b[5] : 0, b && length > 6 ? b[6] : 0, b && length > 7 ? b[7] : 0);
+		}
+	}
 
 	// V97AUX: log first ~40 AUX reads to diagnose eDP link training failures.
 	static int auxLogCount = 0;
