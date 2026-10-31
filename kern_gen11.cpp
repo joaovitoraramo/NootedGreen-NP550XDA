@@ -6285,6 +6285,11 @@ uint8_t Gen11::hwRegsNeedUpdate
 	// plane surface address and stride never get written, leaving the stale BIOS
 	// framebuffer on screen (grey/black vertical bars with only cursor visible).
 	uint8_t need = FunctionCast(hwRegsNeedUpdate, callback->ohwRegsNeedUpdate)(that, param_1, param_2, param_3, param_4, param_5);
+	if (hpdTraceOn() && param_1) {
+		static int nAll = 0;
+		uint32_t fi = getMember<uint32_t>(param_1, 0x1DC);
+		if (fi != 0 && nAll++ < 20) IOLog("XeNG DPB hwRegsNeedUpdate fb%u -> %u (marcado=%d)\n", fi, need, gDpBForceFb == (void *)param_1);
+	}
 	// NP550 USB-C DP: FB externo marcado pelo fbT_hwSetMode (transcoder desligado após hotplug na porta 2) -> modeset completo.
 	if (!need && gDpBForceFb && param_1 == gDpBForceFb) {
 		static int n = 0;
