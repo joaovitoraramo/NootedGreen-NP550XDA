@@ -1272,6 +1272,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN14AppleIntelPort21setupOptimalLaneCountEPK29IODetailedTimingInformationV2j",setupOptimalLaneCount, this->osetupOptimalLaneCount},
 			// V97: Log AUX transactions to diagnose eDP link training failures on RPL
 			{"__ZN14AppleIntelPort7readAUXEjPvj", wrapICLReadAUX, this->orgICLReadAUX},
+			{"__ZN14AppleIntelPort8writeAUXEjPvj", wrapWriteAUX, this->oWriteAUX},
 			// NP550 (-ngreenauxtrace): quem chama o AUX nas portas sem DP (HDMI legado na TC1 = ddi 3).
 			{"__ZN17AppleIntelPortHAL13runAUXCommandEN14AppleIntelPort11AUX_CommandEPjjb", wrapRunAUXCommand, this->oRunAUXCommand},
 			{"__ZN24AppleIntelBaseController20invokeHotplugHandlerEjN14AppleIntelPort8PortModeE", wrapInvokeHotplug, this->oInvokeHotplug},
@@ -3608,7 +3609,66 @@ IOReturn Gen11::wrapRunAUXCommand(void *that, uint32_t cmd, uint32_t *data, uint
 	return FunctionCast(wrapRunAUXCommand, callback->oRunAUXCommand)(that, cmd, data, len, flag);
 }
 
+// NP550 HDMIEMU (-ngreenhdmiemu, 31/10): o HDMI do NP550XDA sai direto da TC1 em modo legado (VBT: HDMI-D, DDC pino 4 =
+// GMBUS 9, sem AUX), mas o caminho AGDC do FB ICL/TGL só conhece DP: depois do Insert na porta AGDC 4 ele fica lendo
+// o DPCD por AUX (timeout) e nunca pede o EDID. Aqui a ddi 3 vira um "sink DP 1.2" emulado: leituras AUX nativas vêm
+// de um DPCD sintético, escritas ficam guardadas nele, e o treinamento aparece sempre concluído. O EDID continua
+// pelo getDDCBlock -> GMBUS (ngreencon3pipe=2). Fase A: só fazer o AGDC avançar; o sinal HDMI vem depois.
+static constexpr uint32_t kHdmiEmuDdi = 3;
+static uint8_t gEmuDpcd[0x2300];
+static bool gEmuInit = false;
+static bool hdmiEmuOn() { static int on = -1; if (on < 0) on = checkKernelArgument("-ngreenhdmiemu") ? 1 : 0; return on == 1; }
+static void hdmiEmuInit() {
+	if (gEmuInit) return;
+	gEmuInit = true;
+	auto *d = gEmuDpcd;
+	d[0x000] = 0x12;   // DPCD 1.2
+	d[0x001] = 0x0A;   // HBR 2,7 Gb/s
+	d[0x002] = 0x84;   // 4 lanes, enhanced frame
+	d[0x003] = 0x01;   // down-spread 0,5%
+	d[0x004] = 0x01;
+	d[0x006] = 0x01;   // 8b/10b
+	d[0x008] = 0x02; d[0x00A] = 0x06;
+	d[0x200] = 0x41;   // SINK_COUNT 1, CP_READY
+	d[0x202] = 0x77; d[0x203] = 0x77;   // CR/EQ/symbol lock em todas as lanes
+	d[0x204] = 0x01;   // interlane align
+	d[0x205] = 0x03;   // receive port 0/1 sync
+	d[0x600] = 0x01;   // SET_POWER D0
+	d[0x2002] = 0x01; d[0x200C] = 0x77; d[0x200D] = 0x77; d[0x200E] = 0x01;
+}
+static void hdmiEmuFixStatus() {   // o "sink" sempre responde treinado, seja qual for o padrão pedido
+	gEmuDpcd[0x202] = 0x77; gEmuDpcd[0x203] = 0x77; gEmuDpcd[0x204] = 0x01;
+	gEmuDpcd[0x206] = 0; gEmuDpcd[0x207] = 0;
+}
+static bool hdmiEmuPort(void *that) {
+	if (!hdmiEmuOn() || !that) return false;
+	auto *cfg = getMember<uint32_t *>(that, 0x548);
+	return cfg && cfg[0] == kHdmiEmuDdi;
+}
+IOReturn Gen11::wrapWriteAUX(void *that, uint32_t address, void *buffer, uint32_t length) {
+	if (hdmiEmuPort(that)) {
+		hdmiEmuInit();
+		auto *b = reinterpret_cast<uint8_t *>(buffer);
+		for (uint32_t i = 0; b && i < length; i++) if (address + i < sizeof(gEmuDpcd)) gEmuDpcd[address + i] = b[i];
+		hdmiEmuFixStatus();
+		static int n = 0;
+		if (n++ < 60) IOLog("XeNG HDMIEMU writeAUX 0x%05x len=%u [0]=%02x [1]=%02x\n", address, length, b && length ? b[0] : 0, b && length > 1 ? b[1] : 0);
+		return kIOReturnSuccess;
+	}
+	return FunctionCast(wrapWriteAUX, callback->oWriteAUX)(that, address, buffer, length);
+}
+
 IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint32_t length) {
+	if (hdmiEmuPort(that)) {
+		hdmiEmuInit();
+		hdmiEmuFixStatus();
+		auto *b = reinterpret_cast<uint8_t *>(buffer);
+		for (uint32_t i = 0; b && i < length; i++) b[i] = address + i < sizeof(gEmuDpcd) ? gEmuDpcd[address + i] : 0;
+		static int n = 0;
+		if (n++ < 80) IOLog("XeNG HDMIEMU readAUX 0x%05x len=%u -> %02x %02x %02x %02x\n", address, length, b && length ? b[0] : 0,
+							b && length > 1 ? b[1] : 0, b && length > 2 ? b[2] : 0, b && length > 3 ? b[3] : 0);
+		return kIOReturnSuccess;
+	}
 
 	IOReturn retVal = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that, address, buffer, length);
 
@@ -4162,6 +4222,15 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 		uint32_t r = (uint32_t)(reg & 0x1FFFFF);
 		if (r == 0x7019C) xeFenceScan(false);
 		val = xeFenceFilterWrite(r, val);
+		// NP550 HDMIEMU: escritas do modeset da porta externa (clocks/DDI D/transcoders B-D/DPCLKA/PHY DKL da TC1)
+		static int hdmiW = -1;
+		if (hdmiW < 0) hdmiW = checkKernelArgument("-ngreenhdmiemu") ? 0 : 1000000;
+		if (hdmiW < 400 && ((r >= 0x46100 && r < 0x46150) || (r >= 0x61000 && r < 0x63600) || (r >= 0x64300 && r < 0x64400) ||
+							(r >= 0x164280 && r < 0x164290) || (r >= 0x168000 && r < 0x16C000) || r == 0x45404 || r == 0x45454 || r == 0x45444 ||
+							r == 0x163894 || (r >= 0x71000 && r < 0x71200) || r == 0x46010 || r == 0x46018 || r == 0x46020)) {
+			hdmiW++;
+			IOLog("XeNG HDMIEMU W %06x = %08x (was %08x)\n", r, val, NGreen::callback ? NGreen::callback->readReg32(r) : 0);
+		}
 	}
 	xeBootDiagRecord(reg, val);
 	val = xeBootHold(reg, val);

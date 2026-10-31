@@ -1554,6 +1554,8 @@ private:
 	mach_vm_address_t oblit3d_submit_rectlist {};
 	
 	static IOReturn wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint32_t length);
+	static IOReturn wrapWriteAUX(void *that, uint32_t address, void *buffer, uint32_t length);   // NP550 HDMIEMU
+	mach_vm_address_t oWriteAUX {};
 	static IOReturn wrapRunAUXCommand(void *that, uint32_t cmd, uint32_t *data, uint32_t len, bool flag);   // NP550 AUXTRACE
 	mach_vm_address_t oRunAUXCommand {};
 	// NP550 HPDTRACE (-ngreenhpdtrace): cadeia do hotplug do HDMI legado (TC1)
