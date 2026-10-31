@@ -32,9 +32,12 @@ static size_t hpGa414PatternCount(const uint8_t *data, size_t length,
 
 static bool hpGa414NoAuxIdentity(bool realTgl, uint32_t cpuModel, uint32_t vendor,
 	uint32_t device, uint32_t subVendor, uint32_t subDevice, bool tahoe, const char *build) {
-	return realTgl && cpuModel == 0x8c && vendor == 0x8086 && device == 0x9a49 &&
-		subVendor == 0x103c && subDevice == 0x8716 && tahoe && build &&
-		strncmp(build, "25G83", sizeof("25G83")) == 0;
+	if (!(realTgl && cpuModel == 0x8c && vendor == 0x8086 && device == 0x9a49 && tahoe && build))
+		return false;
+	// HP Elite Dragonfly G2 on 25G83 (GA414), or Samsung NP550XDA on 25G241: the NOAUX bytes are the XPS repo's,
+	// made for the 25G241 TGL driver; the preflight below still requires exactly one match.
+	return (subVendor == 0x103c && subDevice == 0x8716 && strncmp(build, "25G83", sizeof("25G83")) == 0) ||
+		(subVendor == 0x144d && subDevice == 0xc195 && strncmp(build, "25G241", sizeof("25G241")) == 0);
 }
 
 // ==== 6 kextInfos: ICL fallback + dual TGL identities (com.xxxxx and com.apple) from /Library/Extensions ====
@@ -2300,7 +2303,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				const char *build = reinterpret_cast<const char *>(buildAddress);
 				hpNoAux = hpGa414NoAuxIdentity(true, NGreen::callback->cpuModel, vendor, device,
 					subVendor, subDevice, true, build);
-				IOLog("GA414 NOAUX: gate=%d cpu=0x%x pci=%04x:%04x subsystem=%04x:%04x build=%.5s\n",
+				IOLog("GA414 NOAUX: gate=%d cpu=0x%x pci=%04x:%04x subsystem=%04x:%04x build=%.8s\n",
 					hpNoAux, NGreen::callback->cpuModel, vendor, device, subVendor, subDevice, build ? build : "ERROR");
 				if (!hpNoAux) IOLog("GA414 NOAUX: ERROR exact HP/25G83 identity unavailable or mismatch; not applied\n");
 			}
