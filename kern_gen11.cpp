@@ -3521,6 +3521,16 @@ static void hdmiEmuPowerTc1(const char *why) {
 		for (int i = 0; i < 100 && !(NGreen::callback->readReg32(0x163890) & 1); i++) IODelay(10);
 		NGreen::callback->writeReg32(0x163894, csss | 1);
 	}
+	// TGL: IO e AUX das DDIs Type-C ficam no Power Well 3 (PWR_WELL_CTL2 0x45404, pedido bit 5 / estado bit 4); com só o
+	// eDP aceso a Apple o deixa desligado e o IO da TC1 não sobe (no Linux, com o HDMI aceso, 0x45404 = 0x3f).
+	{
+		uint32_t pw = NGreen::callback->readReg32(0x45404);
+		if (!(pw & 0x20)) NGreen::callback->writeReg32(0x45404, pw | 0x20);
+		int i = 0;
+		for (; i < 1000 && !(NGreen::callback->readReg32(0x45404) & 0x10); i++) IODelay(10);
+		static int n = 0;
+		if (n++ < 6) IOLog("XeNG HDMIEMU power PW3 %08x -> %08x (%dx10us)\n", pw, NGreen::callback->readReg32(0x45404), i);
+	}
 	static const uint32_t regs[] = {0x45444, 0x45454};
 	for (uint32_t reg : regs) {
 		uint32_t v = NGreen::callback->readReg32(reg);
