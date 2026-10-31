@@ -3909,6 +3909,17 @@ static void hdmiEmuEnableOutput() {
 static void hdmiEmuDiag() {
 	static int ticks = 0;
 	auto rd = [](uint32_t r) { return NGreen::callback->readReg32(r); };
+	if (ticks == 1) {   // uma vez: PHY Dekel inteiro (não-nulos) e regs da saída, para comparar com o Linux
+		for (uint32_t bank = 0; bank < 3; bank++)
+			for (uint32_t off = 0; off < 0x1000; off += 4) {
+				uint32_t v = dklRead(bank, off);
+				if (v) IOLog("XeNG DKLDUMP 0x%x %u 0x%08x\n", 0x168000 + off, bank, v);
+			}
+		static const uint32_t regs[] = {0x163880, 0x163884, 0x163888, 0x16388c, 0x163890, 0x163894, 0x163898, 0x1638a0, 0x1638c0,
+			0x46030, 0x4610c, 0x46144, 0x164280, 0x45404, 0x45444, 0x45454, 0x64300, 0x61400, 0x61404, 0x61000, 0x61004, 0x61008,
+			0x6100c, 0x61010, 0x61014, 0x6101c, 0x71008, 0x71030, 0x71180, 0x71188, 0x46000, 0x46514, 0x46510, 0x4651c, 0x61040, 0x61044};
+		for (uint32_t r : regs) IOLog("XeNG DKLDUMP 0x%x - 0x%08x\n", r, rd(r));
+	}
 	IOLog("XeNG HDMIDIAG #%d DBUF S1=%08x S2=%08x | A: P1BUF=%08x CURBUF=%08x WM0=%08x ISR=%08x FRM=%u | B: P1BUF=%08x CURBUF=%08x WM0=%08x ISR=%08x "
 		  "FRM=%u SCAN=%u CONF=%08x FUNC=%08x DDI=%08x P1CTL=%08x | CDCLK=%08x MBUS=%08x ARB_A=%08x ARB_B=%08x\n", ticks,
 		  rd(0x45008), rd(0x44FE8), rd(0x7027C), rd(0x7017C), rd(0x70240), rd(0x44400), rd(0x70040),
