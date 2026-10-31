@@ -15,7 +15,7 @@ static uint64_t agdcT_AGDCEnableController(void *that, uint32_t *a);
 static uint64_t agdcT_GetStreamAssociation(void *that, uint32_t *a, uint32_t *b);
 static uint64_t agdcT_SetFbStatusOnNextProbe(void *that, uint32_t *a);
 static uint64_t agdcT_connectionChanged(void *that);
-static mach_vm_address_t gAgdcOrig[29] {};
+static mach_vm_address_t gAgdcOrig[34] {};
 static uint64_t agdcT_GetLinkConfig(void *that, uint32_t *a, uint32_t *b);
 static uint64_t agdcT_doLinkTraining(void *that, uint32_t *a, uint32_t *b);
 static uint64_t agdcT_AGDCInjectEvent(void *that, uint32_t *a);
@@ -34,6 +34,11 @@ static constexpr uint32_t kHdmiEmuDdi = 3;   // NP550 HDMIEMU: HDMI legado na TC
 static uint64_t fliT_Perform(void *that, void *tx, uint64_t a, void *params);
 static uint64_t fliT_VBL(void *that, uint32_t pipe);
 static uint64_t fliT_CfgVBL(void *that, void *fb, void *path, bool en, bool b);
+static uint64_t fbT_hwSetMode(void *that, void *fb, void *path, void *t);
+static uint64_t fbT_hwSetStream(void *that, void *fb, void *path, void *t);
+static uint64_t fbT_disableDisplay(void *that, void *fb, void *path, uint8_t f);
+static uint64_t fbT_LightUpDP(void *that, void *fb, void *path, void *t);
+static uint64_t fbT_enableController(void *that, void *fb);
 static bool hdmiEmuOn();
 static void hdmiEmuScheduleOutput();
 static void hdmiEmuEnableOutputNow();
@@ -1328,6 +1333,11 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN21AppleIntelFramebuffer22PerformFlipTransactionEP30IOAccelDisplayPipeTransaction2yP21FlipTransactionParams", fliT_Perform, gAgdcOrig[26]},
 			{"__ZN24AppleIntelBaseController25invokeVBLInterruptHandlerEj", fliT_VBL, gAgdcOrig[27]},
 			{"__ZN24AppleIntelBaseController23hwConfigureVBLInterruptEP21AppleIntelFramebufferP21AppleIntelDisplayPathbb", fliT_CfgVBL, gAgdcOrig[28]},
+			{"__ZN24AppleIntelBaseController9hwSetModeEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2", fbT_hwSetMode, gAgdcOrig[29]},
+			{"__ZN24AppleIntelBaseController11hwSetStreamEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2", fbT_hwSetStream, gAgdcOrig[30]},
+			{"__ZN24AppleIntelBaseController14disableDisplayEP21AppleIntelFramebufferP21AppleIntelDisplayPathh", fbT_disableDisplay, gAgdcOrig[31]},
+			{"__ZN24AppleIntelBaseController9LightUpDPEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2", fbT_LightUpDP, gAgdcOrig[32]},
+			{"__ZN24AppleIntelBaseController16enableControllerEP21AppleIntelFramebuffer", fbT_enableController, gAgdcOrig[33]},
 			{"__ZN24AppleIntelBaseController13GetLinkConfigEP16AGDCLinkConfig_tS1_", agdcT_GetLinkConfig, gAgdcOrig[12]},
 			{"__ZN24AppleIntelBaseController14doLinkTrainingEP18AGDCDPPortConfig_tS1_", agdcT_doLinkTraining, gAgdcOrig[13]},
 			{"__ZN24AppleIntelBaseController15AGDCInjectEventEP19AGDCFBInjectEvent_t", agdcT_AGDCInjectEvent, gAgdcOrig[14]},
@@ -4019,6 +4029,48 @@ static void hdmiEmuScheduleOutput() {
 	if (!gHdmiOutTc) gHdmiOutTc = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { hdmiEmuEnableOutput(); }, nullptr);
 	uint64_t d; clock_interval_to_deadline(300, kMillisecondScale, &d);
 	if (gHdmiOutTc) thread_call_enter_delayed(gHdmiOutTc, d);
+}
+
+// NP550 FBTRACE: o FB1 fica "not enabled" (path+0x3644 != 2) e o WindowServer nunca faz flip nele.
+// Quem põe o estado 2: hwSetMode (após LightUpDP/TMDS/EDP) e hwSetStream; disableDisplay rebaixa para 1.
+static void fbTraceFb(const char *what, void *fb, void *path, uint64_t r, uint32_t st0) {
+	if (!hpdTraceOn() || !fb) return;
+	uint32_t idx = getMember<uint32_t>(fb, 0x1DC);
+	static int n[4];
+	if (idx > 3 || n[idx]++ >= (idx == 0 ? 6 : 40)) return;
+	uint32_t st1 = path ? getMember<uint32_t>(path, 0x3644) : 0xFFFF;
+	IOLog("XeNG FBT %s fb%u path=%p st %u->%u r=0x%llx | 3fd8=%d 49e8=%u 49f0=%p 4a00=%u 4a08=%p TRANS_CONF_B=%08x\n", what, idx, path, st0, st1,
+		r & 0xFFFFFFFF, (int)getMember<uint32_t>(fb, 0x3FD8), getMember<uint32_t>(fb, 0x49E8), getMember<void *>(fb, 0x49F0),
+		getMember<uint32_t>(fb, 0x4A00), getMember<void *>(fb, 0x4A08), NGreen::callback->readReg32(0x71008));
+}
+static uint64_t fbT_hwSetMode(void *that, void *fb, void *path, void *t) {
+	uint32_t st0 = path ? getMember<uint32_t>(path, 0x3644) : 0xFFFF;
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, void *, void *, void *)>(gAgdcOrig[29])(that, fb, path, t);
+	fbTraceFb("hwSetMode", fb, path, r, st0);
+	return r;
+}
+static uint64_t fbT_hwSetStream(void *that, void *fb, void *path, void *t) {
+	uint32_t st0 = path ? getMember<uint32_t>(path, 0x3644) : 0xFFFF;
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, void *, void *, void *)>(gAgdcOrig[30])(that, fb, path, t);
+	fbTraceFb("hwSetStream", fb, path, r, st0);
+	return r;
+}
+static uint64_t fbT_disableDisplay(void *that, void *fb, void *path, uint8_t f) {
+	uint32_t st0 = path ? getMember<uint32_t>(path, 0x3644) : 0xFFFF;
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, void *, void *, uint8_t)>(gAgdcOrig[31])(that, fb, path, f);
+	fbTraceFb(f ? "disableDisplay(1)" : "disableDisplay(0)", fb, path, r, st0);
+	return r;
+}
+static uint64_t fbT_LightUpDP(void *that, void *fb, void *path, void *t) {
+	uint32_t st0 = path ? getMember<uint32_t>(path, 0x3644) : 0xFFFF;
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, void *, void *, void *)>(gAgdcOrig[32])(that, fb, path, t);
+	fbTraceFb("LightUpDP", fb, path, r, st0);
+	return r;
+}
+static uint64_t fbT_enableController(void *that, void *fb) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, void *)>(gAgdcOrig[33])(that, fb);
+	fbTraceFb("enableController", fb, nullptr, r, 0xFFFF);
+	return r;
 }
 
 // NP550 FLIPTRACE: flips pedidos ao FB1 e vblanks entregues por pipe (o monitor externo fica preto com a superfície vazia)
