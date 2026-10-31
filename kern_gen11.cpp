@@ -15,7 +15,7 @@ static uint64_t agdcT_AGDCEnableController(void *that, uint32_t *a);
 static uint64_t agdcT_GetStreamAssociation(void *that, uint32_t *a, uint32_t *b);
 static uint64_t agdcT_SetFbStatusOnNextProbe(void *that, uint32_t *a);
 static uint64_t agdcT_connectionChanged(void *that);
-static mach_vm_address_t gAgdcOrig[26] {};
+static mach_vm_address_t gAgdcOrig[29] {};
 static uint64_t agdcT_GetLinkConfig(void *that, uint32_t *a, uint32_t *b);
 static uint64_t agdcT_doLinkTraining(void *that, uint32_t *a, uint32_t *b);
 static uint64_t agdcT_AGDCInjectEvent(void *that, uint32_t *a);
@@ -31,6 +31,9 @@ static uint64_t agdcT_releaseResourceConfigurationSet(void *that, uint32_t *a);
 static uint64_t agdcT_getDisplayPipeCapabilityExtended(void *that, uint32_t *a, uint32_t *b);
 static uint64_t agdcT_FBSetEDID(void *that, uint32_t *a);
 static constexpr uint32_t kHdmiEmuDdi = 3;   // NP550 HDMIEMU: HDMI legado na TC1 (porta AGDC 4)
+static uint64_t fliT_Perform(void *that, void *tx, uint64_t a, void *params);
+static uint64_t fliT_VBL(void *that, uint32_t pipe);
+static uint64_t fliT_CfgVBL(void *that, void *fb, void *path, bool en, bool b);
 static bool hdmiEmuOn();
 static void hdmiEmuScheduleOutput();
 static void hdmiEmuEnableOutputNow();
@@ -1322,6 +1325,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN14AppleIntelPort14probePortStateEv", wrapProbePortState, this->oProbePortState},
 			{"__ZN17AppleIntelPortHAL11getHPDStateEv", wrapGetHPDState, this->oGetHPDState},
 			{"__ZN24AppleIntelBaseController13GetPortStatusEP16AGDCPortStatus_tS1_", agdcT_GetPortStatus, gAgdcOrig[0]},
+			{"__ZN21AppleIntelFramebuffer22PerformFlipTransactionEP30IOAccelDisplayPipeTransaction2yP21FlipTransactionParams", fliT_Perform, gAgdcOrig[26]},
+			{"__ZN24AppleIntelBaseController25invokeVBLInterruptHandlerEj", fliT_VBL, gAgdcOrig[27]},
+			{"__ZN24AppleIntelBaseController23hwConfigureVBLInterruptEP21AppleIntelFramebufferP21AppleIntelDisplayPathbb", fliT_CfgVBL, gAgdcOrig[28]},
 			{"__ZN24AppleIntelBaseController13GetLinkConfigEP16AGDCLinkConfig_tS1_", agdcT_GetLinkConfig, gAgdcOrig[12]},
 			{"__ZN24AppleIntelBaseController14doLinkTrainingEP18AGDCDPPortConfig_tS1_", agdcT_doLinkTraining, gAgdcOrig[13]},
 			{"__ZN24AppleIntelBaseController15AGDCInjectEventEP19AGDCFBInjectEvent_t", agdcT_AGDCInjectEvent, gAgdcOrig[14]},
@@ -3961,6 +3967,8 @@ static void hdmiEmuDiag() {
 			IOLog("XeNG HDMIDIAG superficie %c SURF=%08x amostras=%u nao-pretas=%u primeira=%08x\n", pl ? 'B' : 'A', surfs[pl], samples, nz, first);
 		}
 	}
+	IOLog("XeNG HDMIDIAG #%d irq: A ISR=%08x IMR=%08x IER=%08x | B ISR=%08x IMR=%08x IIR=%08x IER=%08x | DE_MASTER=%08x\n", ticks,
+		  rd(0x44400), rd(0x44404), rd(0x4440C), rd(0x44410), rd(0x44414), rd(0x44418), rd(0x4441C), rd(0x44200));
 	IOLog("XeNG HDMIDIAG #%d mbus: DBOX_A=%08x DBOX_B=%08x CHICKEN_A=%08x CHICKEN_B=%08x OFF_B=%08x AUXD_B=%08x KEYMSK_B=%08x WM1_B=%08x WMTRANS_B=%08x\n", ticks,
 		  rd(0x7003C), rd(0x7103C), rd(0x70038), rd(0x71038), rd(0x711A4), rd(0x711C0), rd(0x711A0), rd(0x71244), rd(0x71268));
 	IOLog("XeNG HDMIDIAG #%d corB: GAMMA=%08x CSC_MODE=%08x PCOLOR=%08x SURF=%08x LIVE=%08x STRIDE=%08x SIZE=%08x POS=%08x BOTTOM=%08x PS=%08x | "
@@ -4011,6 +4019,28 @@ static void hdmiEmuScheduleOutput() {
 	if (!gHdmiOutTc) gHdmiOutTc = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { hdmiEmuEnableOutput(); }, nullptr);
 	uint64_t d; clock_interval_to_deadline(300, kMillisecondScale, &d);
 	if (gHdmiOutTc) thread_call_enter_delayed(gHdmiOutTc, d);
+}
+
+// NP550 FLIPTRACE: flips pedidos ao FB1 e vblanks entregues por pipe (o monitor externo fica preto com a superfície vazia)
+static uint64_t fliT_Perform(void *that, void *tx, uint64_t a, void *params) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, void *, uint64_t, void *)>(gAgdcOrig[26])(that, tx, a, params);
+	uint32_t fb = that ? getMember<uint32_t>(that, 0x1DC) : 99;
+	static int n0 = 0, n1 = 0;
+	int *n = fb == 0 ? &n0 : &n1;
+	if (hpdTraceOn() && (*n)++ < (fb == 0 ? 5 : 40)) IOLog("XeNG FLIP fb%u PerformFlipTransaction a=0x%llx -> 0x%llx SURF_B=%08x\n", fb, a, r & 0xFFFFFFFF,
+			NGreen::callback->readReg32(0x7119C));
+	return r;
+}
+static uint64_t fliT_VBL(void *that, uint32_t pipe) {
+	static uint32_t cnt[4];
+	if (pipe < 4) { cnt[pipe]++; if (hpdTraceOn() && pipe == 1 && (cnt[1] <= 5 || cnt[1] % 600 == 0)) IOLog("XeNG FLIP VBL pipe1 #%u (pipe0 %u)\n", cnt[1], cnt[0]); }
+	return reinterpret_cast<uint64_t (*)(void *, uint32_t)>(gAgdcOrig[27])(that, pipe);
+}
+static uint64_t fliT_CfgVBL(void *that, void *fb, void *path, bool en, bool b) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, void *, void *, bool, bool)>(gAgdcOrig[28])(that, fb, path, en, b);
+	if (hpdTraceOn()) { static int n = 0; if (n++ < 30) IOLog("XeNG FLIP hwConfigureVBLInterrupt fb%u en=%d b=%d -> 0x%llx IMR_B=%08x IER_B=%08x\n",
+		fb ? getMember<uint32_t>(fb, 0x1DC) : 99, en, b, r & 0xFFFFFFFF, NGreen::callback->readReg32(0x44414), NGreen::callback->readReg32(0x4441C)); }
+	return r;
 }
 
 // NP550 AUXTRACE (-ngreenauxtrace): pilha de quem chama runAUXCommand nas ddi 3 (HDMI TC1) e 7, em offsets do
