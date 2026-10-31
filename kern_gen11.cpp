@@ -33,6 +33,8 @@ static uint64_t agdcT_FBSetEDID(void *that, uint32_t *a);
 static constexpr uint32_t kHdmiEmuDdi = 3;   // NP550 HDMIEMU: HDMI legado na TC1 (porta AGDC 4)
 static bool hdmiEmuOn();
 static void hdmiEmuScheduleOutput();
+static void hdmiEmuEnableOutputNow();
+static volatile uint32_t gHdmiOutState = 0;   // NP550 HDMIEMU: 0 nada, 1 agendado/em curso, 2 aceso
 static bool hdmiEmuPort(void *that);
 static void hdmiEmuPowerTc1(const char *why);
 static uint32_t hdmiEmuGmbusRead(uint32_t pin, uint32_t offset, uint8_t *buf, uint32_t len);
@@ -3517,6 +3519,7 @@ uint64_t Gen11::wrapInvokeHotplug(void *that, uint32_t port, uint32_t mode) {
 uint64_t Gen11::wrapHalSetPortMode(void *that, uint32_t mode) {
 	uint32_t before = that ? getMember<uint32_t>(that, 0x550) : 0;
 	uint64_t r = FunctionCast(wrapHalSetPortMode, callback->oHalSetPortMode)(that, mode);
+	if (mode == 0 && hpdDdi(that) == kHdmiEmuDdi) gHdmiOutState = 0;   // HDMI desconectado: religar no próximo hotplug
 	HPDLOG(n, "XeNG HPD setPortMode ddi=%u %u -> %u ret=0x%llx DFLEXDPPMS=%08x CSSS=%08x\n", hpdDdi(that), before, mode, r,
 		   NGreen::callback->readReg32(0x163890), NGreen::callback->readReg32(0x163894));
 	return r;
@@ -3746,6 +3749,9 @@ static uint64_t agdcT_doLinkTraining(void *that, uint32_t *a, uint32_t *b) {
 		r = 0;
 		if (b) b[0x38 / 4] = 0;
 	}
+	// Fase B: acender a saída HDMI já aqui (num DP real o link está ativo quando o pipe começa a mandar quadros). Se o
+	// transcoder B só ligar depois do primeiro flip, a GPU espera um vblank do pipe B que nunca vem e a interface trava.
+	if (hdmiEmuOn() && a && a[0] == kHdmiEmuDdi + 1 && checkKernelArgument("-ngreenhdmiout") && gHdmiOutState != 2) hdmiEmuEnableOutputNow();
 	HPDLOG(n, "XeNG AGDC doLinkTraining in=%08x %08x %08x %08x out=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0,
 		   b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, r & 0xFFFFFFFF);
 	return r;
@@ -3819,7 +3825,6 @@ static uint64_t agdcT_FBSetEDID(void *that, uint32_t *a) {
 // intel_ddi_pre_enable_hdmi), com os valores lidos no Linux com o mesmo monitor aceso (dados-notebook/linux-hdmi:
 // 1080p60, HDMI 12 bpc, TMDS 222,75 MHz no PLL Dekel da TC1).
 static thread_call_t gHdmiOutTc = nullptr;
-static volatile uint32_t gHdmiOutState = 0;   // 0 nada, 1 agendado, 2 aceso
 static thread_call_t gHdmiDiagTc = nullptr;
 static void hdmiEmuDiag();
 static void dklWrite(uint32_t bank, uint32_t off, uint32_t val) {
@@ -3902,6 +3907,10 @@ static void hdmiEmuDiag() {
 		  rd(0x7127C), rd(0x7117C), rd(0x71240), rd(0x44410), rd(0x71040), rd(0x71000) & 0x1FFF, rd(0x71008), rd(0x61400), rd(0x64300),
 		  rd(0x71180), rd(0x46000), rd(0x45038), rd(0x70028), rd(0x71028));
 	if (++ticks < 20) { uint64_t d; clock_interval_to_deadline(3, kSecondScale, &d); thread_call_enter_delayed(gHdmiDiagTc, d); }
+}
+static void hdmiEmuEnableOutputNow() {
+	gHdmiOutState = 1;
+	hdmiEmuEnableOutput();
 }
 static void hdmiEmuScheduleOutput() {
 	if (gHdmiOutState) return;
