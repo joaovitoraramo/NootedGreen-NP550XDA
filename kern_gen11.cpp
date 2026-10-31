@@ -49,7 +49,8 @@ static bool hdmiColorTest();
 static volatile uint32_t gHdmiOutState = 0;   // NP550 HDMIEMU: 0 nada, 1 agendado/em curso, 2 aceso
 static volatile bool gHdmiEmuLinked = false;   // NP550: o AGDC treinou a porta 4 (HDMI); sem isso o pipe B é de outra porta (USB-C)
 static volatile bool gDpBLinked = false;       // NP550: o AGDC treinou a porta 2 (DDI B, DP do USB-C) neste boot
-static mach_vm_address_t gSysctlVars = 0;     // NP550: _gSysctlVariables do FB TGL (+0x120 != 0 força modeset completo)
+static mach_vm_address_t gSysctlVars = 0;
+static mach_vm_address_t gPilAddr = 0;        // NP550: _gPlatformInformationList do FB (base para achar o _gSysctlVariables)     // NP550: _gSysctlVariables do FB TGL (+0x120 != 0 força modeset completo)
 static volatile bool gPipeBDbufFix = false;    // NP550: DDB do pipe B já foi para a fatia S2 (vale para HDMI e USB-C)
 static bool hdmiEmuPort(void *that);
 static void hdmiEmuPowerTc1(const char *why);
@@ -1258,6 +1259,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		}
 		// NP550 USB-C DP: chave de depuração da Apple lida pelo hwRegsNeedUpdate (ver fbT_hwSetMode). Opcional.
 		gSysctlVars = patcher.solveSymbol(index, "_gSysctlVariables", address, size);
+		gPilAddr = gPlatformInformationList;
 		patcher.clearError();
 
 		RouteRequestPlus requests[] = {
@@ -4072,7 +4074,10 @@ static uint64_t fbT_hwSetMode(void *that, void *fb, void *path, void *t) {
 	// só "Partial modeset by updating scaler/plane": nunca chega ao LightUpDP e o monitor fica sem sinal. A Apple tem uma
 	// chave de depuração (_gSysctlVariables+0x120 != 0) que força o modeset completo: liga só durante esta chamada.
 	uint32_t idx = fb ? getMember<uint32_t>(fb, 0x1DC) : 0;
-	uint64_t *force = gSysctlVars ? reinterpret_cast<uint64_t *>(gSysctlVars + 0x120) : nullptr;
+	// Endereço: _gSysctlVariables fica 0x520 antes de _gPlatformInformationList no __common do FB (Tahoe 26.7.1);
+	// o solveSymbol do símbolo local só entra no log para conferência.
+	mach_vm_address_t pil = gPilAddr;
+	uint64_t *force = pil ? reinterpret_cast<uint64_t *>(pil - 0x520 + 0x120) : nullptr;
 	uint64_t forceOld = 0;
 	bool forced = false;
 	if (force && hdmiEmuOn() && gDpBLinked && path && (idx == 1 || idx == 2) && !(gHdmiOutState == 2 && gHdmiEmuLinked) &&
@@ -4085,9 +4090,9 @@ static uint64_t fbT_hwSetMode(void *that, void *fb, void *path, void *t) {
 	if (forced) {
 		*force = forceOld;
 		static int n = 0;
-		if (n++ < 10) IOLog("XeNG DPB hwSetMode fb%u: modeset completo forçado -> 0x%llx estado %u TRANS_CONF=%08x DDI_BUF_B=%08x\n", idx,
+		if (n++ < 10) IOLog("XeNG DPB hwSetMode fb%u: modeset completo forçado -> 0x%llx estado %u TRANS_CONF=%08x DDI_BUF_B=%08x | sysctl pil-0x520=0x%llx solve=0x%llx old=%llu\n", idx,
 							r & 0xFFFFFFFF, getMember<uint32_t>(path, 0x3644), NGreen::callback->readReg32(idx == 1 ? 0x71008 : 0x72008),
-							NGreen::callback->readReg32(0x64100));
+							NGreen::callback->readReg32(0x64100), (unsigned long long)(pil - 0x520), (unsigned long long)gSysctlVars, forceOld);
 	}
 	fbTraceFb("hwSetMode", fb, path, r, st0);
 	// Com o pipe B já aceso pelo HDMIOUT, hwRegsNeedUpdate diz "nada a mudar" e o hwSetMode pega o atalho
