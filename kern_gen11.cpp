@@ -3737,10 +3737,13 @@ static uint64_t agdcT_doLinkTraining(void *that, uint32_t *a, uint32_t *b) {
 	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *, uint32_t *)>(gAgdcOrig[13])(that, a, b);
 	// NP550 HDMIEMU: na porta AGDC 4 (ddi 3, HDMI legado) não existe link DP para treinar; o original programa o PHY em DP
 	// e falha ao conferir o hardware. Responde sucesso para o AGDC seguir para o modeset (Fase B: modeset em HDMI).
-	if (hdmiEmuOn() && a && a[0] == kHdmiEmuDdi + 1 && (r & 0xFFFFFFFF)) {
+	// O AGDC decide pelo status em out+0x38 (0 = treinado; o AppleIntelPort::linkTraining grava o código da falha).
+	if (hdmiEmuOn() && a && a[0] == kHdmiEmuDdi + 1 && ((r & 0xFFFFFFFF) || (b && b[0x38 / 4]))) {
 		static int n = 0;
-		if (n++ < 10) IOLog("XeNG HDMIEMU doLinkTraining porta %u: original 0x%llx -> sucesso emulado\n", a[0], r & 0xFFFFFFFF);
+		if (n++ < 10) IOLog("XeNG HDMIEMU doLinkTraining porta %u: original 0x%llx status=0x%x lane=%08x -> sucesso emulado\n", a[0],
+							r & 0xFFFFFFFF, b ? b[0x38 / 4] : 0xFFFFFFFF, b ? b[0x3c / 4] : 0);
 		r = 0;
+		if (b) b[0x38 / 4] = 0;
 	}
 	HPDLOG(n, "XeNG AGDC doLinkTraining in=%08x %08x %08x %08x out=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0,
 		   b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, r & 0xFFFFFFFF);
