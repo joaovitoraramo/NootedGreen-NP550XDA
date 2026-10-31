@@ -3515,15 +3515,21 @@ static uint32_t hdmiEmuTcColdBlock() {
 }
 static void hdmiEmuPowerTc1(const char *why) {
 	hdmiEmuTcColdBlock();
+	// i915 icl_tc_phy_connect (legado): PHY pronto em DFLEXDPPMS (FIA1 0x163890 bit tc) e posse em DFLEXDPCSSS (0x163894)
+	uint32_t pms = NGreen::callback->readReg32(0x163890), csss = NGreen::callback->readReg32(0x163894);
+	if (!(csss & 1)) {
+		for (int i = 0; i < 100 && !(NGreen::callback->readReg32(0x163890) & 1); i++) IODelay(10);
+		NGreen::callback->writeReg32(0x163894, csss | 1);
+	}
 	static const uint32_t regs[] = {0x45444, 0x45454};
 	for (uint32_t reg : regs) {
 		uint32_t v = NGreen::callback->readReg32(reg);
-		if (!(v & 0x80)) {
-			NGreen::callback->writeReg32(reg, v | 0x80);
-			for (int i = 0; i < 100 && !(NGreen::callback->readReg32(reg) & 0x40); i++) IODelay(10);
-		}
+		if (!(v & 0x80)) NGreen::callback->writeReg32(reg, v | 0x80);
+		int i = 0;
+		for (; i < 1000 && !(NGreen::callback->readReg32(reg) & 0x40); i++) IODelay(10);
 		static int n = 0;
-		if (n++ < 12) IOLog("XeNG HDMIEMU power %s reg=%05x %08x -> %08x\n", why, reg, v, NGreen::callback->readReg32(reg));
+		if (n++ < 12) IOLog("XeNG HDMIEMU power %s reg=%05x %08x -> %08x (%dx10us) PMS=%08x CSSS=%08x->%08x\n", why, reg, v,
+							NGreen::callback->readReg32(reg), i, pms, csss, NGreen::callback->readReg32(0x163894));
 	}
 }
 uint64_t Gen11::wrapGMBusRequest(void *that, uint32_t pin, uint32_t x, void *req) {
