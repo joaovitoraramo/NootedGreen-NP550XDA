@@ -3939,6 +3939,28 @@ static void hdmiEmuDiag() {
 		  rd(0x45008), rd(0x44FE8), rd(0x7027C), rd(0x7017C), rd(0x70240), rd(0x44400), rd(0x70040),
 		  rd(0x7127C), rd(0x7117C), rd(0x71240), rd(0x44410), rd(0x71040), rd(0x71000) & 0x1FFF, rd(0x71008), rd(0x61400), rd(0x64300),
 		  rd(0x71180), rd(0x46000), rd(0x45038), rd(0x70028), rd(0x71028));
+	if (ticks == 2) {   // conteúdo das superfícies dos planos A e B: amostras pela memória física (PTE da GGTT)
+		const uint32_t surfs[2] = {rd(0x7019C), rd(0x7119C)};
+		for (int pl = 0; pl < 2; pl++) {
+			uint32_t surf = surfs[pl] & ~0xFFFu, nz = 0, samples = 0, first = 0;
+			for (uint32_t pg = 0; pg < 2048; pg += 97) {   // ~8 MB do framebuffer, uma página em cada 97
+				uint32_t gpage = (surf >> 12) + pg;
+				uint64_t pte = ((uint64_t)rd(GGTT_PTE_HI(gpage)) << 32) | rd(GGTT_PTE_LO(gpage));
+				if (!(pte & 1)) continue;
+				uint64_t phys = pte & 0x7FFFFFF000ULL;
+				IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(phys, 4096, kIODirectionIn);
+				if (!md) continue;
+				IOMemoryMap *mm = md->map();
+				if (mm) {
+					auto *px = reinterpret_cast<volatile uint32_t *>(mm->getVirtualAddress());
+					for (int k = 0; k < 1024; k += 64) { samples++; if (px[k] & 0x3FFFFFFF) { nz++; if (!first) first = px[k]; } }
+					mm->release();
+				}
+				md->release();
+			}
+			IOLog("XeNG HDMIDIAG superficie %c SURF=%08x amostras=%u nao-pretas=%u primeira=%08x\n", pl ? 'B' : 'A', surfs[pl], samples, nz, first);
+		}
+	}
 	IOLog("XeNG HDMIDIAG #%d mbus: DBOX_A=%08x DBOX_B=%08x CHICKEN_A=%08x CHICKEN_B=%08x OFF_B=%08x AUXD_B=%08x KEYMSK_B=%08x WM1_B=%08x WMTRANS_B=%08x\n", ticks,
 		  rd(0x7003C), rd(0x7103C), rd(0x70038), rd(0x71038), rd(0x711A4), rd(0x711C0), rd(0x711A0), rd(0x71244), rd(0x71268));
 	IOLog("XeNG HDMIDIAG #%d corB: GAMMA=%08x CSC_MODE=%08x PCOLOR=%08x SURF=%08x LIVE=%08x STRIDE=%08x SIZE=%08x POS=%08x BOTTOM=%08x PS=%08x | "
