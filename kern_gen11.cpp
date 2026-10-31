@@ -32,6 +32,7 @@ static uint64_t agdcT_getDisplayPipeCapabilityExtended(void *that, uint32_t *a, 
 static uint64_t agdcT_FBSetEDID(void *that, uint32_t *a);
 static constexpr uint32_t kHdmiEmuDdi = 3;   // NP550 HDMIEMU: HDMI legado na TC1 (porta AGDC 4)
 static bool hdmiEmuOn();
+static void hdmiEmuScheduleOutput();
 static bool hdmiEmuPort(void *that);
 static void hdmiEmuPowerTc1(const char *why);
 static uint32_t hdmiEmuGmbusRead(uint32_t pin, uint32_t offset, uint8_t *buf, uint32_t len);
@@ -3813,6 +3814,85 @@ static uint64_t agdcT_FBSetEDID(void *that, uint32_t *a) {
 	return r;
 }
 
+// NP550 HDMIEMU FASE B: o FB da Apple, achando que a porta AGDC 4 é DP, só monta o plano e o pipe B; transcoder, DDI e
+// PHY ficam desligados. Aqui o kext acende a saída em HDMI na TC1 sozinho, na ordem do i915 (hsw_crtc_enable +
+// intel_ddi_pre_enable_hdmi), com os valores lidos no Linux com o mesmo monitor aceso (dados-notebook/linux-hdmi:
+// 1080p60, HDMI 12 bpc, TMDS 222,75 MHz no PLL Dekel da TC1).
+static thread_call_t gHdmiOutTc = nullptr;
+static volatile uint32_t gHdmiOutState = 0;   // 0 nada, 1 agendado, 2 aceso
+static void dklWrite(uint32_t bank, uint32_t off, uint32_t val) {
+	uint32_t hip = NGreen::callback->readReg32(0x1010A0);
+	NGreen::callback->writeReg32(0x1010A0, (hip & ~0xFu) | bank);
+	NGreen::callback->writeReg32(0x168000 + off, val);
+}
+static uint32_t dklRead(uint32_t bank, uint32_t off) {
+	uint32_t hip = NGreen::callback->readReg32(0x1010A0);
+	NGreen::callback->writeReg32(0x1010A0, (hip & ~0xFu) | bank);
+	return NGreen::callback->readReg32(0x168000 + off);
+}
+static bool waitBits(uint32_t reg, uint32_t mask, uint32_t want, int us) {
+	for (int i = 0; i < us / 10; i++) { if ((NGreen::callback->readReg32(reg) & mask) == want) return true; IODelay(10); }
+	return (NGreen::callback->readReg32(reg) & mask) == want;
+}
+static void hdmiEmuEnableOutput() {
+	auto rd = [](uint32_t r) { return NGreen::callback->readReg32(r); };
+	auto wr = [](uint32_t r, uint32_t v) { NGreen::callback->writeReg32(r, v); };
+	IOLog("XeNG HDMIOUT inicio: TRANS_CONF_B=%08x FUNC_B=%08x DDI_BUF_D=%08x PLL=%08x PW_DDI=%08x PLANE_B=%08x SURF_B=%08x\n",
+		  rd(0x71008), rd(0x61400), rd(0x64300), rd(0x46030), rd(0x45454), rd(0x71180), rd(0x7119C));
+	hdmiEmuPowerTc1("hdmiout");   // TC-cold, posse do PHY, PW3, AUX e IO da TC1
+	// 1. PLL Dekel da TC1 (TC PLL 1, MG_PLL_ENABLE(0) = 0x46030)
+	wr(0x46030, rd(0x46030) | (1u << 27));
+	bool pwr = waitBits(0x46030, 1u << 26, 1u << 26, 2000);
+	dklWrite(2, 0x12C, 0x00000101);   // REFCLKIN_CTL
+	dklWrite(2, 0x0D8, 0x10080510);   // CLKTOP2_CORECLKCTL1
+	dklWrite(2, 0x0D4, 0x0001441D);   // CLKTOP2_HSCLKCTL
+	dklWrite(2, 0x200, 0x50284274);   // PLL_DIV0
+	dklWrite(2, 0x204, 0x0CDCC527);   // PLL_DIV1
+	dklWrite(2, 0x210, 0x400020FF);   // PLL_SSC
+	dklWrite(2, 0x214, 0xC1000000);   // PLL_BIAS
+	dklWrite(2, 0x218, 0x0000004A);   // PLL_TDC_COLDST_BIAS
+	(void)dklRead(2, 0x218);
+	wr(0x46030, rd(0x46030) | (1u << 31));
+	bool lock = waitBits(0x46030, 1u << 30, 1u << 30, 2000);
+	// 2. clock da DDI D a partir do TC PLL e clock da porta liberado
+	wr(0x4610C, 0x80000000);
+	wr(0x164280, rd(0x164280) & ~(1u << 12));
+	// 3. IO da DDI TC1 e lanes da FIA (4 lanes)
+	wr(0x45454, rd(0x45454) | 0x80);
+	bool io = waitBits(0x45454, 0x40, 0x40, 10000);
+	wr(0x1638C0, (rd(0x1638C0) & ~0xFu) | 0xF);
+	// 4. lanes do PHY (bancos 0 e 1): modo e níveis de sinal HDMI como no Linux
+	for (uint32_t ln = 0; ln < 2; ln++) {
+		dklWrite(ln, 0x014, 0x1100A551);   // PCS_DW5
+		dklWrite(ln, 0x0A0, 0x0200B8BC);   // DP_MODE
+		dklWrite(ln, 0x2C0, 0x10000007);   // TX_DPCNTL0
+		dklWrite(ln, 0x2C4, 0x10000007);   // TX_DPCNTL1
+		dklWrite(ln, 0x2C8, 0x00000000);   // TX_DPCNTL2
+	}
+	// 5. transcoder B: clock da porta D, timings 1080p60 (2200x1125), PIPEMISC e modo HDMI 12 bpc
+	wr(0x46144, 0x40000000);
+	wr(0x61000, 0x0897077F); wr(0x61004, 0x0897077F); wr(0x61008, 0x080307D7);
+	wr(0x6100C, 0x04640437); wr(0x61010, 0x04640437); wr(0x61014, 0x0440043B);
+	wr(0x71030, 0x00800100);
+	wr(0x61400, 0xA0330000);
+	wr(0x71008, rd(0x71008) | 0x80000000u);
+	bool tr = waitBits(0x71008, 1u << 30, 1u << 30, 50000);
+	// 6. buffer da DDI D
+	wr(0x64300, 0x80000000);
+	IODelay(600);
+	IOLog("XeNG HDMIOUT fim: pllpwr=%d lock=%d io=%d trans=%d | PLL=%08x PW_DDI=%08x MLE=%08x CLKSEL=%08x FUNC_B=%08x CONF_B=%08x DDI_BUF_D=%08x "
+		  "DIV0=%08x DPMODE=%08x PIPEMISC=%08x PLANE_B=%08x SURF_B=%08x\n", pwr, lock, io, tr, rd(0x46030), rd(0x45454), rd(0x1638C0), rd(0x4610C),
+		  rd(0x61400), rd(0x71008), rd(0x64300), dklRead(2, 0x200), dklRead(0, 0x0A0), rd(0x71030), rd(0x71180), rd(0x7119C));
+	gHdmiOutState = 2;
+}
+static void hdmiEmuScheduleOutput() {
+	if (gHdmiOutState) return;
+	gHdmiOutState = 1;
+	if (!gHdmiOutTc) gHdmiOutTc = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { hdmiEmuEnableOutput(); }, nullptr);
+	uint64_t d; clock_interval_to_deadline(300, kMillisecondScale, &d);
+	if (gHdmiOutTc) thread_call_enter_delayed(gHdmiOutTc, d);
+}
+
 // NP550 AUXTRACE (-ngreenauxtrace): pilha de quem chama runAUXCommand nas ddi 3 (HDMI TC1) e 7, em offsets do
 // binário do FB (slide calculado por _gPlatformInformationList, estático 0x%llx em ngreenauxbase=...).
 IOReturn Gen11::wrapRunAUXCommand(void *that, uint32_t cmd, uint32_t *data, uint32_t len, bool flag) {
@@ -4451,6 +4531,8 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 		uint32_t r = (uint32_t)(reg & 0x1FFFFF);
 		if (r == 0x7019C) xeFenceScan(false);
 		val = xeFenceFilterWrite(r, val);
+		// NP550 HDMIEMU fase B: a Apple apontou o plano 1 do pipe B para a área de trabalho estendida -> acender a saída HDMI
+		if (r == 0x7119C && val && hdmiEmuOn() && checkKernelArgument("-ngreenhdmiout")) hdmiEmuScheduleOutput();
 		// NP550 HDMIEMU: o hwDoGMBusRequest da Apple dispara o GMBUS1 (SW_RDY) sem nunca gravar o pino no GMBUS0 (fica 0 =
 		// nenhum pino e o barramento fica ACTIVE até o timeout). Durante um pedido no pino 9 grava GMBUS0 antes do disparo.
 		if (r == 0xC5104 && gGmbusPin && (val & 0x40000000u) && NGreen::callback) {
