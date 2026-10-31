@@ -3901,6 +3901,8 @@ static void hdmiEmuEnableOutput() {
 	wr(0x71008, (rd(0x71008) & ~0xFCu) | 0x80000000u);   // sem o 10 bpc + dither que a Apple põe (Linux: 0xc0000000)
 	bool tr = waitBits(0x71008, 1u << 30, 1u << 30, 50000);
 	if (hdmiGammaOff()) { wr(0x4AC80, 0); wr(0x49128, rd(0x49128) & ~0x80000000u); }
+	// créditos MBUS/DBOX do pipe B (sem eles o plano não recebe dados da memória): copiar os do pipe A se zerados
+	if (!(rd(0x7103C) & 0xFFFF)) wr(0x7103C, rd(0x7003C));
 	// 6. buffer da DDI D; regravar a superfície do plano B trava (latch) o novo DDB
 	wr(0x64300, 0x80000000);
 	IODelay(600);
@@ -3934,6 +3936,8 @@ static void hdmiEmuDiag() {
 		  rd(0x45008), rd(0x44FE8), rd(0x7027C), rd(0x7017C), rd(0x70240), rd(0x44400), rd(0x70040),
 		  rd(0x7127C), rd(0x7117C), rd(0x71240), rd(0x44410), rd(0x71040), rd(0x71000) & 0x1FFF, rd(0x71008), rd(0x61400), rd(0x64300),
 		  rd(0x71180), rd(0x46000), rd(0x45038), rd(0x70028), rd(0x71028));
+	IOLog("XeNG HDMIDIAG #%d mbus: DBOX_A=%08x DBOX_B=%08x CHICKEN_A=%08x CHICKEN_B=%08x OFF_B=%08x AUXD_B=%08x KEYMSK_B=%08x WM1_B=%08x WMTRANS_B=%08x\n", ticks,
+		  rd(0x7003C), rd(0x7103C), rd(0x70038), rd(0x71038), rd(0x711A4), rd(0x711C0), rd(0x711A0), rd(0x71244), rd(0x71268));
 	IOLog("XeNG HDMIDIAG #%d corB: GAMMA=%08x CSC_MODE=%08x PCOLOR=%08x SURF=%08x LIVE=%08x STRIDE=%08x SIZE=%08x POS=%08x BOTTOM=%08x PS=%08x | "
 		  "corA: GAMMA=%08x CSC_MODE=%08x PCOLOR=%08x\n", ticks, rd(0x4AC80), rd(0x49128), rd(0x711CC), rd(0x7119C), rd(0x711AC), rd(0x71188),
 		  rd(0x71190), rd(0x7118C), rd(0x71034), rd(0x68980), rd(0x4A480), rd(0x49028), rd(0x701CC));
