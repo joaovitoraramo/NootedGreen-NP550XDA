@@ -3820,6 +3820,8 @@ static uint64_t agdcT_FBSetEDID(void *that, uint32_t *a) {
 // 1080p60, HDMI 12 bpc, TMDS 222,75 MHz no PLL Dekel da TC1).
 static thread_call_t gHdmiOutTc = nullptr;
 static volatile uint32_t gHdmiOutState = 0;   // 0 nada, 1 agendado, 2 aceso
+static thread_call_t gHdmiDiagTc = nullptr;
+static void hdmiEmuDiag();
 static void dklWrite(uint32_t bank, uint32_t off, uint32_t val) {
 	uint32_t hip = NGreen::callback->readReg32(0x1010A0);
 	NGreen::callback->writeReg32(0x1010A0, (hip & ~0xFu) | bank);
@@ -3837,6 +3839,8 @@ static bool waitBits(uint32_t reg, uint32_t mask, uint32_t want, int us) {
 static void hdmiEmuEnableOutput() {
 	auto rd = [](uint32_t r) { return NGreen::callback->readReg32(r); };
 	auto wr = [](uint32_t r, uint32_t v) { NGreen::callback->writeReg32(r, v); };
+	if (!gHdmiDiagTc) gHdmiDiagTc = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { hdmiEmuDiag(); }, nullptr);
+	if (checkKernelArgument("-ngreenhdmidiagonly")) { gHdmiOutState = 2; if (gHdmiDiagTc) thread_call_enter(gHdmiDiagTc); return; }
 	IOLog("XeNG HDMIOUT inicio: TRANS_CONF_B=%08x FUNC_B=%08x DDI_BUF_D=%08x PLL=%08x PW_DDI=%08x PLANE_B=%08x SURF_B=%08x\n",
 		  rd(0x71008), rd(0x61400), rd(0x64300), rd(0x46030), rd(0x45454), rd(0x71180), rd(0x7119C));
 	hdmiEmuPowerTc1("hdmiout");   // TC-cold, posse do PHY, PW3, AUX e IO da TC1
@@ -3884,6 +3888,20 @@ static void hdmiEmuEnableOutput() {
 		  "DIV0=%08x DPMODE=%08x PIPEMISC=%08x PLANE_B=%08x SURF_B=%08x\n", pwr, lock, io, tr, rd(0x46030), rd(0x45454), rd(0x1638C0), rd(0x4610C),
 		  rd(0x61400), rd(0x71008), rd(0x64300), dklRead(2, 0x200), dklRead(0, 0x0A0), rd(0x71030), rd(0x71180), rd(0x7119C));
 	gHdmiOutState = 2;
+	if (!gHdmiDiagTc) gHdmiDiagTc = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { hdmiEmuDiag(); }, nullptr);
+	if (gHdmiDiagTc) thread_call_enter(gHdmiDiagTc);
+}
+// Diagnóstico da fase B: a cada 3 s por 1 min depois de acender, DBUF/DDB/watermarks dos pipes A e B, underrun
+// (DE_PIPE_ISR bit 31), contador de quadros do pipe B e estado do transcoder/DDI.
+static void hdmiEmuDiag() {
+	static int ticks = 0;
+	auto rd = [](uint32_t r) { return NGreen::callback->readReg32(r); };
+	IOLog("XeNG HDMIDIAG #%d DBUF S1=%08x S2=%08x | A: P1BUF=%08x CURBUF=%08x WM0=%08x ISR=%08x FRM=%u | B: P1BUF=%08x CURBUF=%08x WM0=%08x ISR=%08x "
+		  "FRM=%u SCAN=%u CONF=%08x FUNC=%08x DDI=%08x P1CTL=%08x | CDCLK=%08x MBUS=%08x ARB_A=%08x ARB_B=%08x\n", ticks,
+		  rd(0x45008), rd(0x44FE8), rd(0x7027C), rd(0x7017C), rd(0x70240), rd(0x44400), rd(0x70040),
+		  rd(0x7127C), rd(0x7117C), rd(0x71240), rd(0x44410), rd(0x71040), rd(0x71000) & 0x1FFF, rd(0x71008), rd(0x61400), rd(0x64300),
+		  rd(0x71180), rd(0x46000), rd(0x45038), rd(0x70028), rd(0x71028));
+	if (++ticks < 20) { uint64_t d; clock_interval_to_deadline(3, kSecondScale, &d); thread_call_enter_delayed(gHdmiDiagTc, d); }
 }
 static void hdmiEmuScheduleOutput() {
 	if (gHdmiOutState) return;
