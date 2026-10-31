@@ -4047,6 +4047,14 @@ static uint64_t fbT_hwSetMode(void *that, void *fb, void *path, void *t) {
 	uint32_t st0 = path ? getMember<uint32_t>(path, 0x3644) : 0xFFFF;
 	uint64_t r = reinterpret_cast<uint64_t (*)(void *, void *, void *, void *)>(gAgdcOrig[29])(that, fb, path, t);
 	fbTraceFb("hwSetMode", fb, path, r, st0);
+	// Com o pipe B já aceso pelo HDMIOUT, hwRegsNeedUpdate diz "nada a mudar" e o hwSetMode pega o atalho
+	// (só enablePlane), que não passa por "path+0x3644 = 2". É o mesmo caso do handoff do boot no eDP, onde
+	// allocateDisplayPathResources já deixa o estado em 2: fazemos o mesmo aqui para o FB1 sair de "not enabled".
+	if (hdmiEmuOn() && gHdmiOutState == 2 && r == 0 && fb && path && getMember<uint32_t>(fb, 0x1DC) == 1 &&
+		getMember<uint32_t>(path, 0x3644) == 1) {
+		getMember<uint32_t>(path, 0x3644) = 2;
+		if (hpdTraceOn()) IOLog("XeNG FBT hwSetMode fb1: atalho sem LightUp, path %p marcado como aceso (estado 2)\n", path);
+	}
 	return r;
 }
 static uint64_t fbT_hwSetStream(void *that, void *fb, void *path, void *t) {
