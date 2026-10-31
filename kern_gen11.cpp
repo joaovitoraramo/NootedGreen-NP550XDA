@@ -3497,7 +3497,23 @@ uint64_t Gen11::wrapPortGetDDCBlock(void *that, uint32_t block, uint8_t *buf, bo
 // wells AUX e DDI da TC1 ligados com o HDMI aceso (PWR_WELL_CTL_AUX2 0x45444 = 0xc3, PWR_WELL_CTL_DDI2 0x45454 = 0xc3:
 // bits 7/6 = pedido/estado da TC1). O FB da Apple trata a porta como DP e não liga o AUX; sem ele o GMBUS no pino 9 só
 // recebe NAK (GMBUS2 bit 9). Antes de cada transação no pino 9 pede os dois e espera o estado.
+// TGL: portas Type-C legadas (e AUX em TC) exigem bloquear o TC-cold pelo PCode (i915 tgl_tc_cold_request:
+// TGL_PCODE_TCCOLD 0x26, dado 0 = bloquear; resposta bit 0 = falhou ao sair do TC-cold).
+static uint32_t hdmiEmuTcColdBlock() {
+	const uint32_t MBOX = 0x138124, DATA = 0x138128, DATA1 = 0x13812C, READY = 0x80000000u;
+	for (int i = 0; i < 500 && (NGreen::callback->readReg32(MBOX) & READY); i++) IODelay(10);
+	NGreen::callback->writeReg32(DATA, 0);
+	NGreen::callback->writeReg32(DATA1, 0);
+	NGreen::callback->writeReg32(MBOX, READY | 0x26);
+	int i = 0;
+	for (; i < 1000 && (NGreen::callback->readReg32(MBOX) & READY); i++) IODelay(10);
+	uint32_t mb = NGreen::callback->readReg32(MBOX), d = NGreen::callback->readReg32(DATA);
+	static int n = 0;
+	if (n++ < 6) IOLog("XeNG HDMIEMU tccold block: mbox=%08x data=%08x waited=%dx10us\n", mb, d, i);
+	return d;
+}
 static void hdmiEmuPowerTc1(const char *why) {
+	hdmiEmuTcColdBlock();
 	static const uint32_t regs[] = {0x45444, 0x45454};
 	for (uint32_t reg : regs) {
 		uint32_t v = NGreen::callback->readReg32(reg);
@@ -4260,8 +4276,11 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 		if (hdmiW < 400 && ((r >= 0x46100 && r < 0x46150) || (r >= 0x61000 && r < 0x63600) || (r >= 0x64300 && r < 0x64400) ||
 							(r >= 0x164280 && r < 0x164290) || (r >= 0x168000 && r < 0x16C000) || r == 0x45404 || r == 0x45454 || r == 0x45444 ||
 							r == 0x163894 || (r >= 0x71000 && r < 0x71200) || r == 0x46010 || r == 0x46018 || r == 0x46020)) {
-			hdmiW++;
-			IOLog("XeNG HDMIEMU W %06x = %08x (was %08x)\n", r, val, NGreen::callback ? NGreen::callback->readReg32(r) : 0);
+			uint32_t old = NGreen::callback ? NGreen::callback->readReg32(r) : 0;
+			if (!((r == 0x45444 || r == 0x45404) && ((old ^ val) & 0xC0) == 0)) {   // AUX/DDI A ligando e desligando o tempo todo
+				hdmiW++;
+				IOLog("XeNG HDMIEMU W %06x = %08x (was %08x)\n", r, val, old);
+			}
 		}
 	}
 	xeBootDiagRecord(reg, val);
