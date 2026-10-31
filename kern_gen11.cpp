@@ -3901,6 +3901,8 @@ static void hdmiEmuEnableOutput() {
 	wr(0x71008, (rd(0x71008) & ~0xFCu) | 0x80000000u);   // sem o 10 bpc + dither que a Apple põe (Linux: 0xc0000000)
 	bool tr = waitBits(0x71008, 1u << 30, 1u << 30, 50000);
 	if (hdmiGammaOff()) { wr(0x4AC80, 0); wr(0x49128, rd(0x49128) & ~0x80000000u); }
+	// teste de cor (-ngreenhdmitest): plano B desligado e fundo do pipe B vermelho (SKL_BOTTOM_COLOR, R em 29:20)
+	if (hdmiColorTest()) { wr(0x71034, 0x3FF00000u); wr(0x71180, rd(0x71180) & ~0x80000000u); wr(0x7119C, rd(0x7119C)); }
 	// créditos MBUS/DBOX do pipe B (sem eles o plano não recebe dados da memória): copiar os do pipe A se zerados
 	if (!(rd(0x7103C) & 0xFFFF)) wr(0x7103C, rd(0x7003C));
 	// 6. buffer da DDI D; regravar a superfície do plano B trava (latch) o novo DDB
@@ -3952,8 +3954,11 @@ static uint32_t hdmiOutRemapBuf(uint32_t v) {
 	return (v & ~0x07FF07FFu) | ((0x400 + size) << 16) | 0x400;
 }
 static bool hdmiGammaOff() { static int v = -1; if (v < 0) v = checkKernelArgument("-ngreenhdmigammaoff") ? 1 : 0; return v == 1; }
+static bool hdmiColorTest() { static int v = -1; if (v < 0) v = checkKernelArgument("-ngreenhdmitest") ? 1 : 0; return v == 1; }
 static uint32_t hdmiOutKeep(uint32_t r, uint32_t val) {
 	uint32_t nv = val;
+	if (hdmiColorTest() && r == 0x71180) { nv = val & ~0x80000000u; if (nv != val) { static int n = 0; if (n++ < 5) IOLog("XeNG HDMIOUT teste: plano B mantido desligado\n"); } return nv; }
+	if (hdmiColorTest() && r == 0x71034) return 0x3FF00000u;
 	switch (r) {
 		case 0x64300: nv = 0x80000000; break;                    // DDI_BUF_CTL D ligado (HDMI)
 		case 0x61400: nv = 0xA0030000; break;                    // TRANS_DDI_FUNC_CTL B: porta D, HDMI, 8 bpc
