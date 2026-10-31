@@ -3802,6 +3802,12 @@ void Gen11::cursorDiag() {
 	#define R(a) NGreen::callback->readReg32(a)
 	uint32_t ctl = R(0x70080), base = R(0x70084), pos = R(0x70088), fbc = R(0x700A0), live = R(0x700AC);
 	IOLog("XeNG CURDIAG #%d CTL=%08x BASE=%08x POS=%08x FBC=%08x LIVE=%08x PLANE_CTL=%08x STRIDE=%08x\n", n, ctl, base, pos, fbc, live, R(0x70180), R(0x70188));
+	if (n <= 2 || n % 6 == 0) {   // DDB/watermarks: too few DBUF blocks for the cursor would make it refetch the same lines
+		IOLog("XeNG CURDIAG #%d DDB CUR=%08x P1=%08x P2=%08x DBUF_S1=%08x S2=%08x ARB=%08x MBUS=%08x\n", n, R(0x7017C), R(0x7027C), R(0x7037C),
+			  R(0x45008), R(0x44FE8), R(0x70028), R(0x45038));
+		IOLog("XeNG CURDIAG #%d CURWM %08x %08x %08x %08x %08x %08x %08x %08x TRANS=%08x P1WM0=%08x P1TRANS=%08x\n", n,
+			  R(0x70140), R(0x70144), R(0x70148), R(0x7014C), R(0x70150), R(0x70154), R(0x70158), R(0x7015C), R(0x70168), R(0x70240), R(0x70268));
+	}
 	uint32_t mode = ctl & 0x27, dim = mode == 0x23 ? 256 : mode == 0x22 ? 128 : 64;
 	if (base && (base != lastBase || ctl != lastCtl)) {
 		for (uint32_t i = 0; i < dim * dim * 4 / 4096 && i < 16; i++)
