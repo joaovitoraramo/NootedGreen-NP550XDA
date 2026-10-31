@@ -4591,8 +4591,40 @@ uint64_t Gen11::getOSInformation(AppleIntel::AppleIntelBaseController *that)
 {
 	// Keep the donor's native TGL platform table; the edits below describe the
 	// author's ADL-P/RPL-P panel and connector layout, not the HP panel.
-	if (NGreen::callback->isRealTGL)
+	if (NGreen::callback->isRealTGL) {
+		// NP550 (31/10): a tabela nativa marca a porta do HDMI (DDI 3) como DP: o FB detecta o hotplug e fica em
+		// "runAUXCommand ddi = 3 Time out" (HDMI não tem AUX). Dump da entrada da plataforma e, com ngreencon<N>type=
+		// (ex. 0x800 = HDMI) / ngreencon<N>flags=, troca o tipo/flags do conector N antes do FB ler a tabela.
+		static bool tglConDone = false;
+		auto *pi = reinterpret_cast<PlatformInfo *>(callback->gPlatformInformationList);
+		if (pi && !tglConDone) {
+			tglConDone = true;
+			uint32_t want = 0;
+			if (auto *dev = OSDynamicCast(IORegistryEntry, reinterpret_cast<OSObject *>(that))) {
+				for (IORegistryEntry *e = dev; e && !want; e = e->getParentEntry(gIOServicePlane)) {
+					if (auto *d = OSDynamicCast(OSData, e->getProperty("AAPL,ig-platform-id")); d && d->getLength() == 4)
+						want = *reinterpret_cast<const uint32_t *>(d->getBytesNoCopy());
+				}
+			}
+			for (int e = 0; e < 48 && pi[e].fInfoPlatformID; e++) {
+				if (want && pi[e].fInfoPlatformID != want) continue;
+				SYSLOG("ngreen", "TGLCON: entry[%d] id=0x%08x mobile=%u pipes=%u ports=%u fbs=%u flags=0x%x", e, pi[e].fInfoPlatformID,
+					   pi[e].fMobile, pi[e].fPipeCount, pi[e].fInfoPortCount, pi[e].fInfoFramebufferCount, pi[e].fInfoFlags);
+				for (int i = 0; i < 9; i++) {
+					auto &c = pi[e].connectors[i];
+					char nm[24]; uint32_t v;
+					snprintf(nm, sizeof(nm), "ngreencon%dtype", i);
+					if (PE_parse_boot_argn(nm, &v, sizeof(v))) { SYSLOG("ngreen", "TGLCON: con%d type 0x%x -> 0x%x", i, c.type, v); c.type = v; }
+					snprintf(nm, sizeof(nm), "ngreencon%dflags", i);
+					if (PE_parse_boot_argn(nm, &v, sizeof(v))) { SYSLOG("ngreen", "TGLCON: con%d flags 0x%x -> 0x%x", i, c.flags, v); c.flags = v; }
+					SYSLOG("ngreen", "TGLCON:   con%d index=%d busId=0x%x pipe=%u pad=0x%x type=0x%x flags=0x%x", i, (int)c.index, c.busId, c.pipe, c.pad, c.type, c.flags);
+				}
+				if (!want) break;
+			}
+			if (!want) SYSLOG("ngreen", "TGLCON: AAPL,ig-platform-id não encontrado; só a entrada [0] listada");
+		}
 		return FunctionCast(getOSInformation, callback->ogetOSInformation)(that);
+	}
 	auto *pinfo = reinterpret_cast<PlatformInfo *>(callback->gPlatformInformationList);
 	if (pinfo) {
 		// Index 1 = the mobile TGL/ADL-P platform entry (0x9A490000 and variants).
