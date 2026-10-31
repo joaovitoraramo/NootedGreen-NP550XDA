@@ -3917,7 +3917,8 @@ static void hdmiEmuEnableOutput() {
 	wr(0x61400, 0xA0030000);   // porta D, HDMI, 8 bpc, +V +H
 	wr(0x71008, (rd(0x71008) & ~0xFCu) | 0x80000000u);   // sem o 10 bpc + dither que a Apple põe (Linux: 0xc0000000)
 	bool tr = waitBits(0x71008, 1u << 30, 1u << 30, 50000);
-	if (hdmiGammaOff()) { wr(0x4AC80, 0); wr(0x49128, rd(0x49128) & ~0x80000000u); }
+	if (hdmiGammaOff()) wr(0x4AC80, 0);
+	wr(0x49128, rd(0x49128) & ~(hdmiGammaOff() ? 0xC0000000u : 0x40000000u));   // saída RGB (ver hdmiOutKeep)
 	// teste de cor (-ngreenhdmitest): plano B desligado e fundo do pipe B vermelho (SKL_BOTTOM_COLOR, R em 29:20)
 	if (hdmiColorTest()) { wr(0x71034, 0x3FF00000u); wr(0x71180, rd(0x71180) & ~0x80000000u); wr(0x7119C, rd(0x7119C)); }
 	// créditos MBUS/DBOX do pipe B (sem eles o plano não recebe dados da memória): copiar os do pipe A se zerados
@@ -4012,7 +4013,10 @@ static uint32_t hdmiOutKeep(uint32_t r, uint32_t val) {
 		case 0x44FE8: nv = val | 0x80000000u; break;             // DBUF fatia S2 ligada
 		case 0x71008: nv = val & ~0xFCu; break;                  // TRANS_CONF B sem bpc/dither do DP
 		case 0x4AC80: if (hdmiGammaOff()) nv = 0; break;         // GAMMA_MODE B em bypass (-ngreenhdmigammaoff)
-		case 0x49128: if (hdmiGammaOff()) nv = val & ~0x80000000u; break;   // PIPE_CSC_MODE B sem CSC
+		// PIPE_CSC_MODE B: a Apple liga o output CSC (bit 30, RGB->YCbCr) como num DP com YCbCr; sem AVI InfoFrame
+		// o monitor HDMI lê RGB e as cores saem trocadas (branco verde, cinza escuro magenta). Saída sempre RGB.
+		case 0x49128: nv = val & ~(hdmiGammaOff() ? 0xC0000000u : 0x40000000u); break;
+		case 0x71030: nv = val & ~(1u << 11); break;            // PIPEMISC B: espaço de cor da saída RGB (sem YUV)
 		case 0x7127C: case 0x7137C: nv = hdmiOutRemapBuf(val); break;   // DDB dos planos do pipe B na S2
 		default: return val;
 	}
