@@ -37,6 +37,7 @@ static void hdmiEmuEnableOutputNow();
 static uint32_t hdmiOutKeep(uint32_t r, uint32_t val);
 static uint32_t hdmiOutRemapBuf(uint32_t v);
 static bool hdmiGammaOff();
+static bool hdmiColorTest();
 static volatile uint32_t gHdmiOutState = 0;   // NP550 HDMIEMU: 0 nada, 1 agendado/em curso, 2 aceso
 static bool hdmiEmuPort(void *that);
 static void hdmiEmuPowerTc1(const char *why);
