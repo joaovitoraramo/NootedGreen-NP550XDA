@@ -16,6 +16,7 @@ static uint64_t agdcT_GetStreamAssociation(void *that, uint32_t *a, uint32_t *b)
 static uint64_t agdcT_SetFbStatusOnNextProbe(void *that, uint32_t *a);
 static uint64_t agdcT_connectionChanged(void *that);
 static mach_vm_address_t gAgdcOrig[12] {};
+static bool hdmiEmuOn();
 #include "AppleIntelParams.hpp"
 #include <Headers/kern_api.hpp>
 #include "kern_genx.hpp"
@@ -3492,7 +3493,24 @@ uint64_t Gen11::wrapPortGetDDCBlock(void *that, uint32_t block, uint8_t *buf, bo
 		   that ? getMember<uint32_t>(that, 0x550) : 0, block, flag, r, buf ? buf[0] : 0, buf ? buf[1] : 0, buf ? buf[8] : 0, buf ? buf[9] : 0);
 	return r;
 }
+// NP550 HDMIEMU: no TGL o DDC (e o HPD) de uma porta Type-C legada passam pelo bloco AUX da porta; o Linux deixa os power
+// wells AUX e DDI da TC1 ligados com o HDMI aceso (PWR_WELL_CTL_AUX2 0x45444 = 0xc3, PWR_WELL_CTL_DDI2 0x45454 = 0xc3:
+// bits 7/6 = pedido/estado da TC1). O FB da Apple trata a porta como DP e não liga o AUX; sem ele o GMBUS no pino 9 só
+// recebe NAK (GMBUS2 bit 9). Antes de cada transação no pino 9 pede os dois e espera o estado.
+static void hdmiEmuPowerTc1(const char *why) {
+	static const uint32_t regs[] = {0x45444, 0x45454};
+	for (uint32_t reg : regs) {
+		uint32_t v = NGreen::callback->readReg32(reg);
+		if (!(v & 0x80)) {
+			NGreen::callback->writeReg32(reg, v | 0x80);
+			for (int i = 0; i < 100 && !(NGreen::callback->readReg32(reg) & 0x40); i++) IODelay(10);
+		}
+		static int n = 0;
+		if (n++ < 12) IOLog("XeNG HDMIEMU power %s reg=%05x %08x -> %08x\n", why, reg, v, NGreen::callback->readReg32(reg));
+	}
+}
 uint64_t Gen11::wrapGMBusRequest(void *that, uint32_t pin, uint32_t x, void *req) {
+	if (pin == 9 && hdmiEmuOn()) hdmiEmuPowerTc1("gmbus");
 	uint64_t r = FunctionCast(wrapGMBusRequest, callback->oGMBusRequest)(that, pin, x, req);
 	HPDLOG(n, "XeNG HPD GMBus pin=%u x=%u ret=0x%llx GMBUS0=%08x GMBUS2=%08x\n", pin, x, r,
 		   NGreen::callback->readReg32(0xC5100), NGreen::callback->readReg32(0xC5108));
