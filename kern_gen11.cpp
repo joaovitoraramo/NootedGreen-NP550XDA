@@ -2,6 +2,20 @@
 //  details.
 #include "kern_gen11.hpp"
 static bool xeFixEnabled();  // xe/xefix, definido junto do FastWriteRegister32
+// NP550 AGDCTRACE: declarações (definidas junto do HPDTRACE)
+static uint64_t agdcT_GetPortStatus(void *that, uint32_t *a, uint32_t *b);
+static uint64_t agdcT_GetPortCapability(void *that, uint32_t *a, uint32_t *b);
+static uint64_t agdcT_StreamGetEDID(void *that, uint32_t *a, uint32_t *b);
+static uint64_t agdcT_AGDCPortEnable(void *that, uint32_t *a);
+static uint64_t agdcT_testResourceConfigurationSet(void *that, uint32_t *a, uint32_t *b);
+static uint64_t agdcT_commitResourceConfigurationSet(void *that, uint32_t *a, uint32_t *b);
+static uint64_t agdcT_SetStreamState(void *that, uint32_t *a);
+static uint64_t agdcT_GetStreamRequest(void *that, uint32_t *a, uint32_t *b);
+static uint64_t agdcT_AGDCEnableController(void *that, uint32_t *a);
+static uint64_t agdcT_GetStreamAssociation(void *that, uint32_t *a, uint32_t *b);
+static uint64_t agdcT_SetFbStatusOnNextProbe(void *that, uint32_t *a);
+static uint64_t agdcT_connectionChanged(void *that);
+static mach_vm_address_t gAgdcOrig[12] {};
 #include "AppleIntelParams.hpp"
 #include <Headers/kern_api.hpp>
 #include "kern_genx.hpp"
@@ -1267,6 +1281,18 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN21AppleIntelFramebuffer13hasDDCConnectEi", wrapHasDDCConnect, this->oHasDDCConnect},
 			{"__ZN14AppleIntelPort14probePortStateEv", wrapProbePortState, this->oProbePortState},
 			{"__ZN17AppleIntelPortHAL11getHPDStateEv", wrapGetHPDState, this->oGetHPDState},
+			{"__ZN24AppleIntelBaseController13GetPortStatusEP16AGDCPortStatus_tS1_", agdcT_GetPortStatus, gAgdcOrig[0]},
+			{"__ZN24AppleIntelBaseController17GetPortCapabilityEP20AGDCPortCapability_tS1_", agdcT_GetPortCapability, gAgdcOrig[1]},
+			{"__ZN24AppleIntelBaseController13StreamGetEDIDEP19AGDCStreamGetEDID_tS1_", agdcT_StreamGetEDID, gAgdcOrig[2]},
+			{"__ZN24AppleIntelBaseController14AGDCPortEnableEP16AGDCPortEnable_t", agdcT_AGDCPortEnable, gAgdcOrig[3]},
+			{"__ZN24AppleIntelBaseController28testResourceConfigurationSetEP30AGDCResourceConfigurationSet_tS1_", agdcT_testResourceConfigurationSet, gAgdcOrig[4]},
+			{"__ZN24AppleIntelBaseController30commitResourceConfigurationSetEP30AGDCResourceConfigurationSet_tS1_", agdcT_commitResourceConfigurationSet, gAgdcOrig[5]},
+			{"__ZN24AppleIntelBaseController14SetStreamStateEP20AGDCStreamSetState_t", agdcT_SetStreamState, gAgdcOrig[6]},
+			{"__ZN24AppleIntelBaseController16GetStreamRequestEP19AGDCStreamRequest_tS1_", agdcT_GetStreamRequest, gAgdcOrig[7]},
+			{"__ZN24AppleIntelBaseController20AGDCEnableControllerEP28AGDCVendorControllerEnable_t", agdcT_AGDCEnableController, gAgdcOrig[8]},
+			{"__ZN24AppleIntelBaseController20GetStreamAssociationEP21AGDCStreamAssociate_tS1_", agdcT_GetStreamAssociation, gAgdcOrig[9]},
+			{"__ZN24AppleIntelBaseController22SetFbStatusOnNextProbeEP14AGDCFBOnline_t", agdcT_SetFbStatusOnNextProbe, gAgdcOrig[10]},
+			{"__ZN21AppleIntelFramebuffer17connectionChangedEv", agdcT_connectionChanged, gAgdcOrig[11]},
 			{"__ZN24AppleIntelBaseController12CallBackAGDCE31kAGDCRegisterLinkControlEvent_tmj", wrapCallBackAGDC, this->oCallBackAGDC},
 			{"__ZN14AppleIntelPort8isHPDLowEv", wrapIsHPDLow, this->oIsHPDLow},
 			// V96: Force display online — WEG's getDisplayStatus hook (FOD) fails with
@@ -3485,6 +3511,75 @@ uint64_t Gen11::wrapGetHPDState(void *that) {
 uint64_t Gen11::wrapIsHPDLow(void *that) {
 	uint64_t r = FunctionCast(wrapIsHPDLow, callback->oIsHPDLow)(that);
 	HPDLOG(n, "XeNG HPD isHPDLow ddi=%u -> %llu\n", hpdDdi(that), r & 0xFF);
+	return r;
+}
+
+// NP550 AGDCTRACE (com -ngreenhpdtrace): chamadas do AGDC ao FB depois do hotplug (1os dwords da entrada/saida e retorno).
+static uint64_t agdcT_GetPortStatus(void *that, uint32_t *a, uint32_t *b) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *, uint32_t *)>(gAgdcOrig[0])(that, a, b);
+	HPDLOG(n, "XeNG AGDC GetPortStatus in=%08x %08x %08x %08x out=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0,
+		   b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_GetPortCapability(void *that, uint32_t *a, uint32_t *b) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *, uint32_t *)>(gAgdcOrig[1])(that, a, b);
+	HPDLOG(n, "XeNG AGDC GetPortCapability in=%08x %08x %08x %08x out=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0,
+		   b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_StreamGetEDID(void *that, uint32_t *a, uint32_t *b) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *, uint32_t *)>(gAgdcOrig[2])(that, a, b);
+	HPDLOG(n, "XeNG AGDC StreamGetEDID in=%08x %08x %08x %08x out=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0,
+		   b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_AGDCPortEnable(void *that, uint32_t *a) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *)>(gAgdcOrig[3])(that, a);
+	HPDLOG(n, "XeNG AGDC AGDCPortEnable in=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_testResourceConfigurationSet(void *that, uint32_t *a, uint32_t *b) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *, uint32_t *)>(gAgdcOrig[4])(that, a, b);
+	HPDLOG(n, "XeNG AGDC testResourceConfigurationSet in=%08x %08x %08x %08x out=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0,
+		   b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_commitResourceConfigurationSet(void *that, uint32_t *a, uint32_t *b) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *, uint32_t *)>(gAgdcOrig[5])(that, a, b);
+	HPDLOG(n, "XeNG AGDC commitResourceConfigurationSet in=%08x %08x %08x %08x out=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0,
+		   b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_SetStreamState(void *that, uint32_t *a) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *)>(gAgdcOrig[6])(that, a);
+	HPDLOG(n, "XeNG AGDC SetStreamState in=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_GetStreamRequest(void *that, uint32_t *a, uint32_t *b) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *, uint32_t *)>(gAgdcOrig[7])(that, a, b);
+	HPDLOG(n, "XeNG AGDC GetStreamRequest in=%08x %08x %08x %08x out=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0,
+		   b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_AGDCEnableController(void *that, uint32_t *a) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *)>(gAgdcOrig[8])(that, a);
+	HPDLOG(n, "XeNG AGDC AGDCEnableController in=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_GetStreamAssociation(void *that, uint32_t *a, uint32_t *b) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *, uint32_t *)>(gAgdcOrig[9])(that, a, b);
+	HPDLOG(n, "XeNG AGDC GetStreamAssociation in=%08x %08x %08x %08x out=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0,
+		   b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_SetFbStatusOnNextProbe(void *that, uint32_t *a) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *)>(gAgdcOrig[10])(that, a);
+	HPDLOG(n, "XeNG AGDC SetFbStatusOnNextProbe in=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_connectionChanged(void *that) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *)>(gAgdcOrig[11])(that);
+	HPDLOG(n, "XeNG AGDC connectionChanged fb%u -> 0x%llx\n", that ? getMember<uint32_t>(that, 0x1DC) : 99, r & 0xFFFFFFFF);
 	return r;
 }
 
