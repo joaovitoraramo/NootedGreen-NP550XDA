@@ -3906,7 +3906,50 @@ static uint32_t xeBootHold(unsigned long reg, uint32_t val) {
 	if (nseen < 8) seen[nseen++] = val;
 	return val;
 }
+// NP550 (31/10, XE-FENCE): o driver da Apple liga a FENCE0 (X-tiled, pitch 7680) sobre GGTT 0..64 MB por causa do
+// framebuffer de boot em GGTT 0, mas a memória do cursor fica em 0x02040000, dentro dela: a seta gravada pela CPU via
+// abertura sai em blocos X e o plano do cursor (sempre linear) mostra tracinhos empilhados. Limita o fim de toda fence
+// que começa abaixo de 32 MB a 32 MB (o FB de boot 1920x1080 usa ~8 MB). -ngreennofenceclamp desliga.
+static constexpr uint32_t kXeFenceLimit = 0x02000000;
+static bool xeFenceClampOn() {
+	static int v = -1;
+	if (v < 0) v = checkKernelArgument("-ngreennofenceclamp") ? 0 : 1;
+	return v == 1;
+}
+static uint32_t xeFenceClampHi(uint32_t lo, uint32_t hi) {   // hi: bits 31:12 = fim - 4 KB, bits 11:0 = pitch/128 - 1
+	if (!(lo & 1) || (lo & 0xFFFFF000u) >= kXeFenceLimit) return hi;
+	if ((hi & 0xFFFFF000u) + 0x1000u <= kXeFenceLimit) return hi;
+	static int n = 0;
+	uint32_t nhi = (hi & 0xFFFu) | (kXeFenceLimit - 0x1000u);
+	if (n++ < 8) IOLog("XeNG FENCE: lo=%08x hi=%08x -> %08x (fim limitado a 0x%x, cursor fora da fence)\n", lo, hi, nhi, kXeFenceLimit);
+	return nhi;
+}
+static void xeFenceScan(bool force) {   // pega fences gravadas por caminhos que não passam pelos hooks
+	if (!NGreen::callback || !xeFenceClampOn()) return;
+	static uint32_t tick = 0;
+	if (!force && (tick++ & 63)) return;
+	for (uint32_t f = 0; f < 32; f++) {
+		uint32_t lo = NGreen::callback->readReg32(0x100000 + 8 * f);
+		if (!(lo & 1)) continue;
+		uint32_t hi = NGreen::callback->readReg32(0x100004 + 8 * f), nhi = xeFenceClampHi(lo, hi);
+		if (nhi != hi) {   // como o i915: desliga, grava o fim, religa
+			NGreen::callback->writeReg32(0x100000 + 8 * f, 0);
+			NGreen::callback->writeReg32(0x100004 + 8 * f, nhi);
+			NGreen::callback->writeReg32(0x100000 + 8 * f, lo);
+		}
+	}
+}
+static thread_call_t gXeFenceTimer = nullptr;
+static uint32_t xeFenceFilterWrite(uint32_t r, uint32_t val) {
+	if (r < 0x100000 || r >= 0x100100 || !(r & 4) || !NGreen::callback || !xeFenceClampOn()) return val;
+	return xeFenceClampHi(NGreen::callback->readReg32(r - 4) | 1, val);   // lo pode estar desligado durante a troca
+}
 static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
+	{
+		uint32_t r = (uint32_t)(reg & 0x1FFFFF);
+		if (r == 0x7019C) xeFenceScan(false);
+		val = xeFenceFilterWrite(r, val);
+	}
 	xeBootDiagRecord(reg, val);
 	val = xeBootHold(reg, val);
 	// NP550XDA: o XE-BLR (brilho) sozinho, sem o resto do -ngreenxefix (ajustes de Alder Lake/display 13).
@@ -5116,6 +5159,12 @@ bool Gen11::AppleIntelBaseControllerstart(AppleIntel::AppleIntelBaseController *
 			if (tc10) thread_call_enter_delayed(tc10, d10);
 			if (tc40) thread_call_enter_delayed(tc40, d40);
 			if (checkKernelArgument("-ngreencurdiag")) cursorDiagStart();
+			gXeFenceTimer = thread_call_allocate([](thread_call_param_t, thread_call_param_t) {   // XE-FENCE: 10 min, a cada 5 s
+				static int ticks = 0;
+				xeFenceScan(true);
+				if (++ticks < 120) { uint64_t d; clock_interval_to_deadline(5, kSecondScale, &d); thread_call_enter_delayed(gXeFenceTimer, d); }
+			}, nullptr);
+			if (gXeFenceTimer) { uint64_t d; clock_interval_to_deadline(5, kSecondScale, &d); thread_call_enter_delayed(gXeFenceTimer, d); }
 		}
 	}
 	
@@ -10940,6 +10989,11 @@ void Gen11::raWriteRegister64(void *that,unsigned long param_1,UInt64 param_2)
 {
 	//if (reinterpret_cast<volatile uint64_t*>(that)==nullptr) return;
 
+	{   // XE-FENCE: fence gravada como 64 bits (lo | hi << 32)
+		const uint32_t r = static_cast<uint32_t>(param_1 & 0x1FFFFF);
+		if (r >= 0x100000 && r < 0x100100 && !(r & 4) && NGreen::callback && xeFenceClampOn())
+			param_2 = (static_cast<UInt64>(xeFenceClampHi(static_cast<uint32_t>(param_2), static_cast<uint32_t>(param_2 >> 32))) << 32) | static_cast<uint32_t>(param_2);
+	}
 	if (NGreen::callback) {
 		const uint32_t reg = static_cast<uint32_t>(param_1 & 0xFFFFF);
 		const bool looksLikePlaneSurf =
