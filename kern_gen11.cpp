@@ -36,6 +36,7 @@ static void hdmiEmuScheduleOutput();
 static void hdmiEmuEnableOutputNow();
 static uint32_t hdmiOutKeep(uint32_t r, uint32_t val);
 static uint32_t hdmiOutRemapBuf(uint32_t v);
+static bool hdmiGammaOff();
 static volatile uint32_t gHdmiOutState = 0;   // NP550 HDMIEMU: 0 nada, 1 agendado/em curso, 2 aceso
 static bool hdmiEmuPort(void *that);
 static void hdmiEmuPowerTc1(const char *why);
@@ -3899,6 +3900,7 @@ static void hdmiEmuEnableOutput() {
 	wr(0x61400, 0xA0030000);   // porta D, HDMI, 8 bpc, +V +H
 	wr(0x71008, (rd(0x71008) & ~0xFCu) | 0x80000000u);   // sem o 10 bpc + dither que a Apple põe (Linux: 0xc0000000)
 	bool tr = waitBits(0x71008, 1u << 30, 1u << 30, 50000);
+	if (hdmiGammaOff()) { wr(0x4AC80, 0); wr(0x49128, rd(0x49128) & ~0x80000000u); }
 	// 6. buffer da DDI D; regravar a superfície do plano B trava (latch) o novo DDB
 	wr(0x64300, 0x80000000);
 	IODelay(600);
@@ -3932,6 +3934,9 @@ static void hdmiEmuDiag() {
 		  rd(0x45008), rd(0x44FE8), rd(0x7027C), rd(0x7017C), rd(0x70240), rd(0x44400), rd(0x70040),
 		  rd(0x7127C), rd(0x7117C), rd(0x71240), rd(0x44410), rd(0x71040), rd(0x71000) & 0x1FFF, rd(0x71008), rd(0x61400), rd(0x64300),
 		  rd(0x71180), rd(0x46000), rd(0x45038), rd(0x70028), rd(0x71028));
+	IOLog("XeNG HDMIDIAG #%d corB: GAMMA=%08x CSC_MODE=%08x PCOLOR=%08x SURF=%08x LIVE=%08x STRIDE=%08x SIZE=%08x POS=%08x BOTTOM=%08x PS=%08x | "
+		  "corA: GAMMA=%08x CSC_MODE=%08x PCOLOR=%08x\n", ticks, rd(0x4AC80), rd(0x49128), rd(0x711CC), rd(0x7119C), rd(0x711AC), rd(0x71188),
+		  rd(0x71190), rd(0x7118C), rd(0x71034), rd(0x68980), rd(0x4A480), rd(0x49028), rd(0x701CC));
 	if (++ticks < 20) { uint64_t d; clock_interval_to_deadline(3, kSecondScale, &d); thread_call_enter_delayed(gHdmiDiagTc, d); }
 }
 // DDB do pipe B inteiro na fatia S2 (blocos 0x400..), longe do pipe A (S1); cursor B já fica em 0x7b0..
@@ -3942,6 +3947,7 @@ static uint32_t hdmiOutRemapBuf(uint32_t v) {
 	if (size > 0x3A0) size = 0x3A0;   // até 0x7a0, antes do cursor B (0x7b0)
 	return (v & ~0x07FF07FFu) | ((0x400 + size) << 16) | 0x400;
 }
+static bool hdmiGammaOff() { static int v = -1; if (v < 0) v = checkKernelArgument("-ngreenhdmigammaoff") ? 1 : 0; return v == 1; }
 static uint32_t hdmiOutKeep(uint32_t r, uint32_t val) {
 	uint32_t nv = val;
 	switch (r) {
@@ -3955,6 +3961,8 @@ static uint32_t hdmiOutKeep(uint32_t r, uint32_t val) {
 		case 0x1638C0: nv = (val & ~0xFu) | 0xF; break;          // FIA: 4 lanes na TC1
 		case 0x44FE8: nv = val | 0x80000000u; break;             // DBUF fatia S2 ligada
 		case 0x71008: nv = val & ~0xFCu; break;                  // TRANS_CONF B sem bpc/dither do DP
+		case 0x4AC80: if (hdmiGammaOff()) nv = 0; break;         // GAMMA_MODE B em bypass (-ngreenhdmigammaoff)
+		case 0x49128: if (hdmiGammaOff()) nv = val & ~0x80000000u; break;   // PIPE_CSC_MODE B sem CSC
 		case 0x7127C: case 0x7137C: nv = hdmiOutRemapBuf(val); break;   // DDB dos planos do pipe B na S2
 		default: return val;
 	}
