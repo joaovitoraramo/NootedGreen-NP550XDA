@@ -15,7 +15,21 @@ static uint64_t agdcT_AGDCEnableController(void *that, uint32_t *a);
 static uint64_t agdcT_GetStreamAssociation(void *that, uint32_t *a, uint32_t *b);
 static uint64_t agdcT_SetFbStatusOnNextProbe(void *that, uint32_t *a);
 static uint64_t agdcT_connectionChanged(void *that);
-static mach_vm_address_t gAgdcOrig[12] {};
+static mach_vm_address_t gAgdcOrig[26] {};
+static uint64_t agdcT_GetLinkConfig(void *that, uint32_t *a, uint32_t *b);
+static uint64_t agdcT_doLinkTraining(void *that, uint32_t *a, uint32_t *b);
+static uint64_t agdcT_AGDCInjectEvent(void *that, uint32_t *a);
+static uint64_t agdcT_GetStreamConfig(void *that, uint32_t *a);
+static uint64_t agdcT_SetStreamConfig(void *that, uint32_t *a);
+static uint64_t agdcT_GetGPUCapability(void *that, uint32_t *a);
+static uint64_t agdcT_doLinkTrainingEnd(void *that, uint32_t *a);
+static uint64_t agdcT_GetMultiLinkConfig(void *that, uint32_t *a, uint32_t *b);
+static uint64_t agdcT_doLinkTrainingBegin(void *that, uint32_t *a);
+static uint64_t agdcT_AGDCStreamSleepControl(void *that, uint32_t *a);
+static uint64_t agdcT_getDisplayPipeCapability(void *that, uint32_t *a, uint32_t *b);
+static uint64_t agdcT_releaseResourceConfigurationSet(void *that, uint32_t *a);
+static uint64_t agdcT_getDisplayPipeCapabilityExtended(void *that, uint32_t *a, uint32_t *b);
+static uint64_t agdcT_FBSetEDID(void *that, uint32_t *a);
 static bool hdmiEmuOn();
 static bool hdmiEmuPort(void *that);
 static void hdmiEmuPowerTc1(const char *why);
@@ -1300,6 +1314,20 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN14AppleIntelPort14probePortStateEv", wrapProbePortState, this->oProbePortState},
 			{"__ZN17AppleIntelPortHAL11getHPDStateEv", wrapGetHPDState, this->oGetHPDState},
 			{"__ZN24AppleIntelBaseController13GetPortStatusEP16AGDCPortStatus_tS1_", agdcT_GetPortStatus, gAgdcOrig[0]},
+			{"__ZN24AppleIntelBaseController13GetLinkConfigEP16AGDCLinkConfig_tS1_", agdcT_GetLinkConfig, gAgdcOrig[12]},
+			{"__ZN24AppleIntelBaseController14doLinkTrainingEP18AGDCDPPortConfig_tS1_", agdcT_doLinkTraining, gAgdcOrig[13]},
+			{"__ZN24AppleIntelBaseController15AGDCInjectEventEP19AGDCFBInjectEvent_t", agdcT_AGDCInjectEvent, gAgdcOrig[14]},
+			{"__ZN24AppleIntelBaseController15GetStreamConfigEP20AGDCDPStreamConfig_t", agdcT_GetStreamConfig, gAgdcOrig[15]},
+			{"__ZN24AppleIntelBaseController15SetStreamConfigEP20AGDCDPStreamConfig_t", agdcT_SetStreamConfig, gAgdcOrig[16]},
+			{"__ZN24AppleIntelBaseController16GetGPUCapabilityEP19AGDCGPUCapability_t", agdcT_GetGPUCapability, gAgdcOrig[17]},
+			{"__ZN24AppleIntelBaseController17doLinkTrainingEndEP23AGDCDPLinkTrainingEnd_t", agdcT_doLinkTrainingEnd, gAgdcOrig[18]},
+			{"__ZN24AppleIntelBaseController18GetMultiLinkConfigEP21AGDCMultiLinkConfig_tS1_", agdcT_GetMultiLinkConfig, gAgdcOrig[19]},
+			{"__ZN24AppleIntelBaseController19doLinkTrainingBeginEP25AGDCDPLinkTrainingBegin_t", agdcT_doLinkTrainingBegin, gAgdcOrig[20]},
+			{"__ZN24AppleIntelBaseController22AGDCStreamSleepControlEP24AGDCDPStreamSleepValue_t", agdcT_AGDCStreamSleepControl, gAgdcOrig[21]},
+			{"__ZN24AppleIntelBaseController24getDisplayPipeCapabilityEP28AGDCFBGetDisplayCapability_tS1_", agdcT_getDisplayPipeCapability, gAgdcOrig[22]},
+			{"__ZN24AppleIntelBaseController31releaseResourceConfigurationSetEP28AGDCFBReleaseConfiguration_t", agdcT_releaseResourceConfigurationSet, gAgdcOrig[23]},
+			{"__ZN24AppleIntelBaseController32getDisplayPipeCapabilityExtendedEP29AGDCFBGetExtendedCapability_tS1_", agdcT_getDisplayPipeCapabilityExtended, gAgdcOrig[24]},
+			{"__ZN24AppleIntelBaseController9FBSetEDIDEP19AGDCFBSetEDIDData_t", agdcT_FBSetEDID, gAgdcOrig[25]},
 			{"__ZN24AppleIntelBaseController17GetPortCapabilityEP20AGDCPortCapability_tS1_", agdcT_GetPortCapability, gAgdcOrig[1]},
 			{"__ZN24AppleIntelBaseController13StreamGetEDIDEP19AGDCStreamGetEDID_tS1_", agdcT_StreamGetEDID, gAgdcOrig[2]},
 			{"__ZN24AppleIntelBaseController14AGDCPortEnableEP16AGDCPortEnable_t", agdcT_AGDCPortEnable, gAgdcOrig[3]},
@@ -3695,6 +3723,82 @@ static uint64_t agdcT_SetFbStatusOnNextProbe(void *that, uint32_t *a) {
 static uint64_t agdcT_connectionChanged(void *that) {
 	uint64_t r = reinterpret_cast<uint64_t (*)(void *)>(gAgdcOrig[11])(that);
 	HPDLOG(n, "XeNG AGDC connectionChanged fb%u -> 0x%llx\n", that ? getMember<uint32_t>(that, 0x1DC) : 99, r & 0xFFFFFFFF);
+	return r;
+}
+
+static uint64_t agdcT_GetLinkConfig(void *that, uint32_t *a, uint32_t *b) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *, uint32_t *)>(gAgdcOrig[12])(that, a, b);
+	HPDLOG(n, "XeNG AGDC GetLinkConfig in=%08x %08x %08x %08x out=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0,
+		   b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_doLinkTraining(void *that, uint32_t *a, uint32_t *b) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *, uint32_t *)>(gAgdcOrig[13])(that, a, b);
+	HPDLOG(n, "XeNG AGDC doLinkTraining in=%08x %08x %08x %08x out=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0,
+		   b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_AGDCInjectEvent(void *that, uint32_t *a) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *)>(gAgdcOrig[14])(that, a);
+	HPDLOG(n, "XeNG AGDC AGDCInjectEvent in=%08x %08x %08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0, a ? a[4] : 0, a ? a[5] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_GetStreamConfig(void *that, uint32_t *a) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *)>(gAgdcOrig[15])(that, a);
+	HPDLOG(n, "XeNG AGDC GetStreamConfig in=%08x %08x %08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0, a ? a[4] : 0, a ? a[5] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_SetStreamConfig(void *that, uint32_t *a) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *)>(gAgdcOrig[16])(that, a);
+	HPDLOG(n, "XeNG AGDC SetStreamConfig in=%08x %08x %08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0, a ? a[4] : 0, a ? a[5] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_GetGPUCapability(void *that, uint32_t *a) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *)>(gAgdcOrig[17])(that, a);
+	HPDLOG(n, "XeNG AGDC GetGPUCapability in=%08x %08x %08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0, a ? a[4] : 0, a ? a[5] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_doLinkTrainingEnd(void *that, uint32_t *a) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *)>(gAgdcOrig[18])(that, a);
+	HPDLOG(n, "XeNG AGDC doLinkTrainingEnd in=%08x %08x %08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0, a ? a[4] : 0, a ? a[5] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_GetMultiLinkConfig(void *that, uint32_t *a, uint32_t *b) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *, uint32_t *)>(gAgdcOrig[19])(that, a, b);
+	HPDLOG(n, "XeNG AGDC GetMultiLinkConfig in=%08x %08x %08x %08x out=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0,
+		   b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_doLinkTrainingBegin(void *that, uint32_t *a) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *)>(gAgdcOrig[20])(that, a);
+	HPDLOG(n, "XeNG AGDC doLinkTrainingBegin in=%08x %08x %08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0, a ? a[4] : 0, a ? a[5] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_AGDCStreamSleepControl(void *that, uint32_t *a) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *)>(gAgdcOrig[21])(that, a);
+	HPDLOG(n, "XeNG AGDC AGDCStreamSleepControl in=%08x %08x %08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0, a ? a[4] : 0, a ? a[5] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_getDisplayPipeCapability(void *that, uint32_t *a, uint32_t *b) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *, uint32_t *)>(gAgdcOrig[22])(that, a, b);
+	HPDLOG(n, "XeNG AGDC getDisplayPipeCapability in=%08x %08x %08x %08x out=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0,
+		   b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_releaseResourceConfigurationSet(void *that, uint32_t *a) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *)>(gAgdcOrig[23])(that, a);
+	HPDLOG(n, "XeNG AGDC releaseResourceConfigurationSet in=%08x %08x %08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0, a ? a[4] : 0, a ? a[5] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_getDisplayPipeCapabilityExtended(void *that, uint32_t *a, uint32_t *b) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *, uint32_t *)>(gAgdcOrig[24])(that, a, b);
+	HPDLOG(n, "XeNG AGDC getDisplayPipeCapabilityExtended in=%08x %08x %08x %08x out=%08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0,
+		   b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, r & 0xFFFFFFFF);
+	return r;
+}
+static uint64_t agdcT_FBSetEDID(void *that, uint32_t *a) {
+	uint64_t r = reinterpret_cast<uint64_t (*)(void *, uint32_t *)>(gAgdcOrig[25])(that, a);
+	HPDLOG(n, "XeNG AGDC FBSetEDID in=%08x %08x %08x %08x %08x %08x -> 0x%llx\n", a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0, a ? a[4] : 0, a ? a[5] : 0, r & 0xFFFFFFFF);
 	return r;
 }
 
