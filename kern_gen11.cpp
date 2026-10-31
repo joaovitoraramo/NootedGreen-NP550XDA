@@ -3856,7 +3856,9 @@ static void hdmiEmuEnableOutput() {
 	bool pwr = waitBits(0x46030, 1u << 26, 1u << 26, 2000);
 	dklWrite(2, 0x12C, 0x00000101);   // REFCLKIN_CTL
 	dklWrite(2, 0x0D8, 0x10080510);   // CLKTOP2_CORECLKCTL1
-	dklWrite(2, 0x0D4, 0x0001441D);   // CLKTOP2_HSCLKCTL
+	// CLKTOP2_HSCLKCTL: o Linux usou HDMI 12 bpc (TMDS 222,75 MHz, div1=2); aqui 8 bpc a 148,5 MHz: mesmo DCO de 8,91 GHz
+	// (i915 icl_mg_pll_find_divisors), só o HSDIV muda de 2 para 3 (bits 13:12 = 1). No 12 bpc o pipe rodava a 90 Hz.
+	dklWrite(2, 0x0D4, 0x0001541D);
 	dklWrite(2, 0x200, 0x50284274);   // PLL_DIV0
 	dklWrite(2, 0x204, 0x0CDCC527);   // PLL_DIV1
 	dklWrite(2, 0x210, 0x400020FF);   // PLL_SSC
@@ -3894,7 +3896,7 @@ static void hdmiEmuEnableOutput() {
 	wr(0x61000, 0x0897077F); wr(0x61004, 0x0897077F); wr(0x61008, 0x080307D7);
 	wr(0x6100C, 0x04640437); wr(0x61010, 0x04640437); wr(0x61014, 0x0440043B);
 	wr(0x71030, 0x00800100);
-	wr(0x61400, 0xA0330000);
+	wr(0x61400, 0xA0030000);   // porta D, HDMI, 8 bpc, +V +H
 	wr(0x71008, (rd(0x71008) & ~0xFCu) | 0x80000000u);   // sem o 10 bpc + dither que a Apple põe (Linux: 0xc0000000)
 	bool tr = waitBits(0x71008, 1u << 30, 1u << 30, 50000);
 	// 6. buffer da DDI D; regravar a superfície do plano B trava (latch) o novo DDB
@@ -3944,7 +3946,7 @@ static uint32_t hdmiOutKeep(uint32_t r, uint32_t val) {
 	uint32_t nv = val;
 	switch (r) {
 		case 0x64300: nv = 0x80000000; break;                    // DDI_BUF_CTL D ligado (HDMI)
-		case 0x61400: nv = 0xA0330000; break;                    // TRANS_DDI_FUNC_CTL B: porta D, HDMI, 12 bpc
+		case 0x61400: nv = 0xA0030000; break;                    // TRANS_DDI_FUNC_CTL B: porta D, HDMI, 8 bpc
 		case 0x46144: nv = 0x40000000; break;                    // TRANS_CLK_SEL B = porta D
 		case 0x4610C: nv = 0x80000000; break;                    // DDI_CLK_SEL D = TC PLL
 		case 0x46030: nv = val | 0x88000000u; break;             // TC PLL 1 ligado e alimentado
