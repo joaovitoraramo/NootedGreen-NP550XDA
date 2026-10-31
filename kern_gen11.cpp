@@ -4226,6 +4226,24 @@ IOReturn Gen11::wrapWriteAUX(void *that, uint32_t address, void *buffer, uint32_
 							address, length, b && length ? b[0] : 0, b && length > 1 ? b[1] : 0, b && length > 2 ? b[2] : 0, b && length > 3 ? b[3] : 0, ret,
 							NGreen::callback->readReg32(0x64100), NGreen::callback->readReg32(0x61540), NGreen::callback->readReg32(0x61544),
 							NGreen::callback->readReg32(0x164280), NGreen::callback->readReg32(0x45454));
+		// Fim da fase 1 sem sucesso (padrão desligado após TPS1): PHY combo B lane a lane (base 0x6C000, regs do i915 ICL+).
+		static uint8_t lastTp = 0;
+		if (address == 0x102 && length && b) {
+			static int nd = 0;
+			if (b[0] == 0 && lastTp == 0x21 && nd++ < 2) {
+				auto rd = [](uint32_t r) { return NGreen::callback->readReg32(r); };
+				IOLog("XeNG DPB PHYB CL_DW5=%08x CL_DW10=%08x COMP_DW0=%08x COMP_DW3=%08x DDI_BUF_B=%08x DP_TP_CTL_B=%08x DDI_CLK_SEL? DPCLKA=%08x\n",
+					  rd(0x6C014), rd(0x6C028), rd(0x6C100), rd(0x6C10C), rd(0x64100), rd(0x61540), rd(0x164280));
+				for (uint32_t ln = 0; ln < 4; ln++) {
+					uint32_t L = 0x6C800 + ln * 0x100;
+					IOLog("XeNG DPB PHYB ln%u PCS_DW1=%08x TX_DW2=%08x TX_DW4=%08x TX_DW5=%08x TX_DW7=%08x\n", ln,
+						  rd(L + 0x04), rd(L + 0x88), rd(L + 0x90), rd(L + 0x94), rd(L + 0x9C));
+				}
+				IOLog("XeNG DPB PHYB grp PCS_DW1=%08x TX_DW2=%08x TX_DW4=%08x TX_DW5=%08x TX_DW7=%08x\n",
+					  rd(0x6C604), rd(0x6C688), rd(0x6C690), rd(0x6C694), rd(0x6C69C));
+			}
+			lastTp = b[0];
+		}
 	}
 	return ret;
 }
