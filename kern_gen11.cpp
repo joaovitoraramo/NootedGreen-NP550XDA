@@ -3845,6 +3845,27 @@ void Gen11::cursorDiagStart() {
 	if (gXeCurTimer) thread_call_enter_delayed(gXeCurTimer, d);
 }
 
+// NP550 brilho (-ngreenbldiag): PWM da luz de fundo (CNP+: CTL 0xC8250, período 0xC8254, duty 0xC8258) antes do FB da
+// Apple (valores do firmware, tela forte) e a cada 10 s por 5 min (o que a Apple pede x o que o XE-BLR entrega).
+static thread_call_t gXeBlTimer = nullptr;
+static void xeBlDiag(const char *tag) {
+	if (!NGreen::callback) return;
+	IOLog("XeNG BLDIAG %s CTL=%08x FREQ=%u DUTY=%u | hw=%u apple=%u fw=%u lastDuty=%u maxDuty=%u out=%u\n", tag,
+		  NGreen::callback->readReg32(0xC8250), NGreen::callback->readReg32(0xC8254), NGreen::callback->readReg32(0xC8258),
+		  gBlHwFreq, gBlAppleFreq, gBlFreqWrites, gBlLastDuty, gBlMaxDuty, gBlLastOut);
+}
+static void xeBlDiagStart() {
+	if (gXeBlTimer || !checkKernelArgument("-ngreenbldiag")) return;
+	xeBlDiag("pre-FBstart");
+	gXeBlTimer = thread_call_allocate([](thread_call_param_t, thread_call_param_t) {
+		static int ticks = 0;
+		xeBlDiag("tick");
+		if (++ticks < 30) { uint64_t d; clock_interval_to_deadline(10, kSecondScale, &d); thread_call_enter_delayed(gXeBlTimer, d); }
+	}, nullptr);
+	uint64_t d; clock_interval_to_deadline(10, kSecondScale, &d);
+	if (gXeBlTimer) thread_call_enter_delayed(gXeBlTimer, d);
+}
+
 static thread_call_t gXeBhTimer = nullptr;
 static void xeBootHoldRelease(const char *why) {   // write Apple's last CTL, re-arm with the current SURF, backlight back on
 	if (gXeBhDone) return;
@@ -5146,6 +5167,7 @@ bool Gen11::AppleIntelBaseControllerstart(AppleIntel::AppleIntelBaseController *
 
 	SYSLOG("ngreen", "FBController::start() entering...");
 	xeBootHoldInit();
+	xeBlDiagStart();
 	xeBootDiagDump("pre-FBstart");
 	auto ret=FunctionCast(AppleIntelBaseControllerstart, callback->oAppleIntelBaseControllerstart)(that,param_1 );
 	SYSLOG("ngreen", "FBController::start() returned %d", ret);
