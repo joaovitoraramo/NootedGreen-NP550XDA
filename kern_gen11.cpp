@@ -4275,7 +4275,7 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 		if (hdmiW < 0) hdmiW = checkKernelArgument("-ngreenhdmiemu") ? 0 : 1000000;
 		if (hdmiW < 400 && ((r >= 0x46100 && r < 0x46150) || (r >= 0x61000 && r < 0x63600) || (r >= 0x64300 && r < 0x64400) ||
 							(r >= 0x164280 && r < 0x164290) || (r >= 0x168000 && r < 0x16C000) || r == 0x45404 || r == 0x45454 || r == 0x45444 ||
-							r == 0x163894 || (r >= 0x71000 && r < 0x71200) || r == 0x46010 || r == 0x46018 || r == 0x46020)) {
+							r == 0x163894 || (r >= 0xC5100 && r < 0xC5120) || (r >= 0x71000 && r < 0x71200) || r == 0x46010 || r == 0x46018 || r == 0x46020)) {
 			uint32_t old = NGreen::callback ? NGreen::callback->readReg32(r) : 0;
 			if (!((r == 0x45444 || r == 0x45404) && ((old ^ val) & 0xC0) == 0)) {   // AUX/DDI A ligando e desligando o tempo todo
 				hdmiW++;
