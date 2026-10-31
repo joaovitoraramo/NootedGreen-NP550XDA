@@ -3933,7 +3933,7 @@ static void hdmiEmuEnableOutput() {
 		  rd(0x61400), rd(0x71008), rd(0x64300), dklRead(2, 0x200), dklRead(0, 0x0A0), rd(0x71030), rd(0x71180), rd(0x7119C));
 	gHdmiOutState = 2;
 	if (!gHdmiDiagTc) gHdmiDiagTc = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { hdmiEmuDiag(); }, nullptr);
-	if (gHdmiDiagTc) thread_call_enter(gHdmiDiagTc);
+	if (gHdmiDiagTc && hpdTraceOn()) thread_call_enter(gHdmiDiagTc);   // HDMIDIAG só com -ngreenhpdtrace
 }
 // Diagnóstico da fase B: a cada 3 s por 1 min depois de acender, DBUF/DDB/watermarks dos pipes A e B, underrun
 // (DE_PIPE_ISR bit 31), contador de quadros do pipe B e estado do transcoder/DDI.
