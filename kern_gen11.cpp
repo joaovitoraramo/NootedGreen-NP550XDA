@@ -47,6 +47,8 @@ static uint32_t hdmiOutRemapBuf(uint32_t v);
 static bool hdmiGammaOff();
 static bool hdmiColorTest();
 static volatile uint32_t gHdmiOutState = 0;   // NP550 HDMIEMU: 0 nada, 1 agendado/em curso, 2 aceso
+static volatile bool gHdmiEmuLinked = false;   // NP550: o AGDC treinou a porta 4 (HDMI); sem isso o pipe B é de outra porta (USB-C)
+static volatile bool gPipeBDbufFix = false;    // NP550: DDB do pipe B já foi para a fatia S2 (vale para HDMI e USB-C)
 static bool hdmiEmuPort(void *that);
 static void hdmiEmuPowerTc1(const char *why);
 static uint32_t hdmiEmuGmbusRead(uint32_t pin, uint32_t offset, uint8_t *buf, uint32_t len);
@@ -3539,7 +3541,7 @@ uint64_t Gen11::wrapInvokeHotplug(void *that, uint32_t port, uint32_t mode) {
 uint64_t Gen11::wrapHalSetPortMode(void *that, uint32_t mode) {
 	uint32_t before = that ? getMember<uint32_t>(that, 0x550) : 0;
 	uint64_t r = FunctionCast(wrapHalSetPortMode, callback->oHalSetPortMode)(that, mode);
-	if (mode == 0 && hpdDdi(that) == kHdmiEmuDdi) gHdmiOutState = 0;   // HDMI desconectado: religar no próximo hotplug
+	if (mode == 0 && hpdDdi(that) == kHdmiEmuDdi) { gHdmiOutState = 0; gHdmiEmuLinked = false; }   // HDMI desconectado: religar no próximo hotplug
 	HPDLOG(n, "XeNG HPD setPortMode ddi=%u %u -> %u ret=0x%llx DFLEXDPPMS=%08x CSSS=%08x\n", hpdDdi(that), before, mode, r,
 		   NGreen::callback->readReg32(0x163890), NGreen::callback->readReg32(0x163894));
 	return r;
@@ -3762,6 +3764,7 @@ static uint64_t agdcT_doLinkTraining(void *that, uint32_t *a, uint32_t *b) {
 	// NP550 HDMIEMU: na porta AGDC 4 (ddi 3, HDMI legado) não existe link DP para treinar; o original programa o PHY em DP
 	// e falha ao conferir o hardware. Responde sucesso para o AGDC seguir para o modeset (Fase B: modeset em HDMI).
 	// O AGDC decide pelo status em out+0x38 (0 = treinado; o AppleIntelPort::linkTraining grava o código da falha).
+	if (hdmiEmuOn() && a && a[0] == kHdmiEmuDdi + 1) gHdmiEmuLinked = true;
 	if (hdmiEmuOn() && a && a[0] == kHdmiEmuDdi + 1 && ((r & 0xFFFFFFFF) || (b && b[0x38 / 4]))) {
 		static int n = 0;
 		if (n++ < 10) IOLog("XeNG HDMIEMU doLinkTraining porta %u: original 0x%llx status=0x%x lane=%08x -> sucesso emulado\n", a[0],
@@ -4758,8 +4761,25 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 		// NP550 HDMIOUT: com a saída HDMI acesa, o caminho DP da Apple desfaz o que não reconhece (desliga o buffer da DDI D,
 		// o IO da TC1...) e põe o DDB do pipe B por cima do pipe A e na fatia S2 desligada (underrun = faixas no painel).
 		if (gHdmiOutState == 2 && hdmiEmuOn()) val = hdmiOutKeep(r, val);
+		// NP550 pipe B em qualquer saída externa (HDMI ou DP do USB-C): a Apple põe o DDB dos planos do pipe B por cima do
+		// pipe A e/ou na fatia S2 desligada (underrun = faixas no painel). Liga a S2 e move o DDB do pipe B para ela.
+		else if (hdmiEmuOn() && NGreen::callback) {
+			if ((r == 0x7127C || r == 0x7137C) && (val & 0x07FF07FFu)) {
+				if (!(NGreen::callback->readReg32(0x44FE8) & 0x80000000u)) {
+					NGreen::callback->writeReg32(0x44FE8, NGreen::callback->readReg32(0x44FE8) | 0x80000000u);
+					for (int i = 0; i < 100 && !(NGreen::callback->readReg32(0x44FE8) & 0x40000000u); i++) IODelay(10);
+				}
+				uint32_t nv = hdmiOutRemapBuf(val);
+				static int n = 0;
+				if (nv != val && n++ < 10) IOLog("XeNG PIPEB dbuf %06x %08x -> %08x S2=%08x\n", r, val, nv, NGreen::callback->readReg32(0x44FE8));
+				val = nv;
+				gPipeBDbufFix = true;
+			}
+			if (r == 0x44FE8 && gPipeBDbufFix) val |= 0x80000000u;
+		}
 		// NP550 HDMIEMU fase B: a Apple apontou o plano 1 do pipe B para a área de trabalho estendida -> acender a saída HDMI
-		if (r == 0x7119C && val && hdmiEmuOn() && checkKernelArgument("-ngreenhdmiout")) hdmiEmuScheduleOutput();
+		// (só se o hotplug foi na porta HDMI; com o DP do USB-C o pipe B é dele)
+		if (r == 0x7119C && val && hdmiEmuOn() && gHdmiEmuLinked && checkKernelArgument("-ngreenhdmiout")) hdmiEmuScheduleOutput();
 		// NP550 HDMIEMU: o hwDoGMBusRequest da Apple dispara o GMBUS1 (SW_RDY) sem nunca gravar o pino no GMBUS0 (fica 0 =
 		// nenhum pino e o barramento fica ACTIVE até o timeout). Durante um pedido no pino 9 grava GMBUS0 antes do disparo.
 		if (r == 0xC5104 && gGmbusPin && (val & 0x40000000u) && NGreen::callback) {
