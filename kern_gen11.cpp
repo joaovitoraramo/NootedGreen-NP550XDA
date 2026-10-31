@@ -3769,6 +3769,16 @@ static uint64_t agdcT_doLinkTraining(void *that, uint32_t *a, uint32_t *b) {
 		r = 0;
 		if (b) b[0x38 / 4] = 0;
 	}
+	// NP550 USB-C (DDI B, combo PHY, porta AGDC 2, DP pelo mux do PD): no hotplug o AGDC treina o link antes de existir
+	// display path para a porta, e o AppleIntelPort::linkTraining desiste ("Port is not associated to any path"). O path
+	// só nasce no modeset (allocateDisplayResources), cujo LightUpDP treina de novo, aí com path. Responde sucesso aqui.
+	if (hdmiEmuOn() && a && a[0] == 2 && ((r & 0xFFFFFFFF) || (b && b[0x38 / 4]))) {
+		static int n = 0;
+		if (n++ < 10) IOLog("XeNG DPB doLinkTraining porta 2: original 0x%llx status=0x%x in=%08x %08x %08x %08x -> sucesso (treino real no LightUpDP)\n",
+							r & 0xFFFFFFFF, b ? b[0x38 / 4] : 0xFFFFFFFF, a[0], a[1], a[2], a[3]);
+		r = 0;
+		if (b) b[0x38 / 4] = 0;
+	}
 	// Fase B: acender a saída HDMI já aqui (num DP real o link está ativo quando o pipe começa a mandar quadros). Se o
 	// transcoder B só ligar depois do primeiro flip, a GPU espera um vblank do pipe B que nunca vem e a interface trava.
 	if (hdmiEmuOn() && a && a[0] == kHdmiEmuDdi + 1 && checkKernelArgument("-ngreenhdmiout") && gHdmiOutState != 2) hdmiEmuEnableOutputNow();
