@@ -4262,7 +4262,7 @@ static void dpbPrepTraining(uint8_t bw, uint8_t lanes) {
 	}
 	static int n = 0;
 	if (n++ < 20) IOLog("XeNG DPB prep bw=%02x lanes=%u pll=%d DPLL1=%08x %08x %08x CLKA=%08x CLKSEL_B=%08x FUNC_B=%08x -> %08x DDI_PW=%08x/%08x SDEISR=%08x\n",
-						bw, lanes, pll, rd(0x46014), rd(0x16428C), rd(0x164290), rd(0x164280), rd(0x46144), f, rd(0x61400), rd(0x45400), rd(0x45404), rd(0xC4008));
+						bw, lanes, pll, rd(0x46014), rd(0x16428C), rd(0x164290), rd(0x164280), rd(0x46144), f, rd(0x61400), rd(0x45400), rd(0x45404), rd(0xC4000));
 }
 IOReturn Gen11::wrapWriteAUX(void *that, uint32_t address, void *buffer, uint32_t length) {
 	if (address == 0x100 && length >= 2 && buffer && gDpBLinked && hdmiEmuOn() && that) {
@@ -4275,6 +4275,18 @@ IOReturn Gen11::wrapWriteAUX(void *that, uint32_t address, void *buffer, uint32_
 			IOReturn r8 = FunctionCast(wrapWriteAUX, callback->oWriteAUX)(that, 0x108, &one, 1);
 			static int n = 0;
 			if (n++ < 10) IOLog("XeNG DPB writeAUX 0x00108 <- 01 -> 0x%x\n", r8);
+		}
+	}
+	// NP550 USB-C DP: TRAINING_PATTERN_SET com os TRAINING_LANEx_SET zerados na mesma transação, como o i915 (a Apple
+	// grava só o 0x102 e as lanes ficam com o "swing máximo atingido" da tentativa anterior).
+	if (address == 0x102 && length == 1 && buffer && *reinterpret_cast<uint8_t *>(buffer) == 0x21 && gDpBLinked && hdmiEmuOn() && that) {
+		auto *c = getMember<uint32_t *>(that, 0x548);
+		if (c && c[0] == 1) {
+			uint8_t tp[3] = {0x21, 0, 0};
+			IOReturn r = FunctionCast(wrapWriteAUX, callback->oWriteAUX)(that, 0x102, tp, 3);
+			static int n = 0;
+			if (n++ < 10) IOLog("XeNG DPB writeAUX 0x00102 <- 21 00 00 -> 0x%x\n", r);
+			return r;
 		}
 	}
 	if (hdmiEmuPort(that)) {
@@ -4357,8 +4369,8 @@ IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint3
 			static int ne = 0;
 			if (retVal && ne++ < 12) {
 				auto rd = [](uint32_t r) { return NGreen::callback->readReg32(r); };
-				IOLog("XeNG DPB auxerr AUX_CTL_B=%08x SDEISR=%08x SHOTPLUG_DDI=%08x DP_TP_ST_B=%08x DDI_BUF_B=%08x TP_B=%08x FUNC_B=%08x PIPE_B_IIR=%08x\n",
-					  rd(0x64110), rd(0xC4008), rd(0xC4030), rd(0x61544), rd(0x64100), rd(0x61540), rd(0x61400), rd(0x44418));
+				IOLog("XeNG DPB auxerr AUX_CTL_B=%08x SDEISR=%08x SDEIIR=%08x SHOTPLUG_DDI=%08x DP_TP_ST_B=%08x DDI_BUF_B=%08x TP_B=%08x FUNC_B=%08x PIPE_B_IIR=%08x\n",
+					  rd(0x64110), rd(0xC4000), rd(0xC4008), rd(0xC4030), rd(0x61544), rd(0x64100), rd(0x61540), rd(0x61400), rd(0x44418));
 			}
 		}
 	}
