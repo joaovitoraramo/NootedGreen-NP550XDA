@@ -4928,6 +4928,14 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 		// NP550 HDMIOUT: com a saída HDMI acesa, o caminho DP da Apple desfaz o que não reconhece (desliga o buffer da DDI D,
 		// o IO da TC1...) e põe o DDB do pipe B por cima do pipe A e na fatia S2 desligada (underrun = faixas no painel).
 		if (gDpBLinked && hdmiEmuOn()) val = dpbPhyFix(r, val);
+		// NP550 USB-C DP: com o link de verdade em HBR2 o AUX da DDI B dá timeout durante o treino. Como o i915 (SKL+):
+		// TIME_OUT_MAX e 32 pulsos de sync/fast-wake no DP_AUX_CH_CTL_B.
+		if (r == 0x64110 && gDpBLinked && hdmiEmuOn() && (val & 0x80000000u)) {
+			uint32_t nv = (val & ~(0x0C000000u | 0x3FFu)) | 0x0C000000u | (31u << 5) | 31u;
+			static int n = 0;
+			if (n++ < 30) IOLog("XeNG DPB auxctl %08x -> %08x (antes %08x)\n", val, nv, NGreen::callback ? NGreen::callback->readReg32(0x64110) : 0);
+			val = nv;
+		}
 		if (gHdmiOutState == 2 && hdmiEmuOn()) val = hdmiOutKeep(r, val);
 		// NP550 pipe B em qualquer saída externa (HDMI ou DP do USB-C): a Apple põe o DDB dos planos do pipe B por cima do
 		// pipe A e/ou na fatia S2 desligada (underrun = faixas no painel). Liga a S2 e move o DDB do pipe B para ela.
