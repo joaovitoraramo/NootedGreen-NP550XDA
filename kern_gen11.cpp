@@ -4241,6 +4241,10 @@ IOReturn Gen11::wrapWriteAUX(void *that, uint32_t address, void *buffer, uint32_
 				}
 				IOLog("XeNG DPB PHYB grp PCS_DW1=%08x TX_DW2=%08x TX_DW4=%08x TX_DW5=%08x TX_DW7=%08x\n",
 					  rd(0x6C604), rd(0x6C688), rd(0x6C690), rd(0x6C694), rd(0x6C69C));
+				// Transcoder/clock/PLL no momento da falha (Linux: FUNC_CTL_B 0x92330002 x2, DPLL1 0x00e001a5/0x48).
+				IOLog("XeNG DPB TRANS FUNC_A=%08x FUNC_B=%08x FUNC_C=%08x CONF_A=%08x CONF_B=%08x CLKSEL_A=%08x CLKSEL_B=%08x DPLL0=%08x %08x %08x DPLL1=%08x %08x %08x MISC_B=%08x TP_A=%08x\n",
+					  rd(0x60400), rd(0x61400), rd(0x62400), rd(0x70008), rd(0x71008), rd(0x46140), rd(0x46144),
+					  rd(0x46010), rd(0x164284), rd(0x164288), rd(0x46014), rd(0x16428C), rd(0x164290), rd(0x64C04), rd(0x60540));
 				// Primeira falha: PHY B inteiro (comum + lanes), para comparar com o dump do Linux.
 				if (nd == 1) {
 					static const uint32_t rg[][2] = {{0x6C000, 0x6C200}, {0x6C800, 0x6CC00}};
