@@ -4251,6 +4251,15 @@ static void dpbPrepTraining(uint8_t bw, uint8_t lanes) {
 			for (int i = 0; i < 100 && !(rd(0x45404) & st); i++) IODelay(10);
 		}
 	}
+	// Power wells de AUX A e B (PWR_WELL_CTL_AUX2 0x45444: pedido bits 1/3, estado bits 0/2): a Apple nunca pede os de
+	// A/B (só o da TC1, bits 7:6); o i915 deixa 0xb durante o modeset. Sem o da B, o AUX dá timeout com a DDI B ligada.
+	for (uint32_t pw = 0; pw < 2; pw++) {
+		uint32_t req = 0x2u << (pw * 2), st = 0x1u << (pw * 2);
+		if (!(rd(0x45444) & st)) {
+			wr(0x45444, rd(0x45444) | req);
+			for (int i = 0; i < 100 && !(rd(0x45444) & st); i++) IODelay(10);
+		}
+	}
 	// Transcoder antes do treino, como o i915 (-ngreendpbnotrans desliga).
 	static int tr = -1;
 	if (tr < 0) tr = checkKernelArgument("-ngreendpbnotrans") ? 0 : 1;
@@ -4261,8 +4270,8 @@ static void dpbPrepTraining(uint8_t bw, uint8_t lanes) {
 		if (nf != f) wr(0x61400, nf);
 	}
 	static int n = 0;
-	if (n++ < 20) IOLog("XeNG DPB prep bw=%02x lanes=%u pll=%d DPLL1=%08x %08x %08x CLKA=%08x CLKSEL_B=%08x FUNC_B=%08x -> %08x DDI_PW=%08x/%08x SDEISR=%08x\n",
-						bw, lanes, pll, rd(0x46014), rd(0x16428C), rd(0x164290), rd(0x164280), rd(0x46144), f, rd(0x61400), rd(0x45400), rd(0x45404), rd(0xC4000));
+	if (n++ < 20) IOLog("XeNG DPB prep bw=%02x lanes=%u pll=%d DPLL1=%08x %08x %08x CLKA=%08x CLKSEL_B=%08x FUNC_B=%08x -> %08x DDI_PW=%08x/%08x AUXPW=%08x SDEISR=%08x\n",
+						bw, lanes, pll, rd(0x46014), rd(0x16428C), rd(0x164290), rd(0x164280), rd(0x46144), f, rd(0x61400), rd(0x45400), rd(0x45404), rd(0x45444), rd(0xC4000));
 }
 // NP550 USB-C DP: estado comparado antes de ligar a DDI B e na falha do AUX (CDCLK, AUX, lane AUX do PHY B, pipe B).
 static void dpbStateDump(const char *tag) {
@@ -5007,6 +5016,7 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 		// NP550 HDMIOUT: com a saída HDMI acesa, o caminho DP da Apple desfaz o que não reconhece (desliga o buffer da DDI D,
 		// o IO da TC1...) e põe o DDB do pipe B por cima do pipe A e na fatia S2 desligada (underrun = faixas no painel).
 		if (gDpBLinked && hdmiEmuOn()) val = dpbPhyFix(r, val);
+		if (r == 0x45444 && gDpBLinked && hdmiEmuOn()) val |= 0xAu;   // AUX A/B ligados enquanto o DP do USB-C existe
 		// NP550 USB-C DP: a Apple liga o enhanced framing no DPCD (LANE_COUNT_SET 0x82) mas não no DP_TP_CTL do TGL.
 		if (r == 0x61540 && gDpBLinked && hdmiEmuOn() && (val & 0x80000000u)) val |= 0x00040000u;
 		if (gHdmiOutState == 2 && hdmiEmuOn()) val = hdmiOutKeep(r, val);
