@@ -4264,6 +4264,14 @@ static void dpbPrepTraining(uint8_t bw, uint8_t lanes) {
 	if (n++ < 20) IOLog("XeNG DPB prep bw=%02x lanes=%u pll=%d DPLL1=%08x %08x %08x CLKA=%08x CLKSEL_B=%08x FUNC_B=%08x -> %08x DDI_PW=%08x/%08x SDEISR=%08x\n",
 						bw, lanes, pll, rd(0x46014), rd(0x16428C), rd(0x164290), rd(0x164280), rd(0x46144), f, rd(0x61400), rd(0x45400), rd(0x45404), rd(0xC4000));
 }
+// NP550 USB-C DP: estado comparado antes de ligar a DDI B e na falha do AUX (CDCLK, AUX, lane AUX do PHY B, pipe B).
+static void dpbStateDump(const char *tag) {
+	if (!NGreen::callback) return;
+	auto rd = [](uint32_t r) { return NGreen::callback->readReg32(r); };
+	IOLog("XeNG DPB ST %s CDCLK=%08x DEPLL=%08x AUXPW=%08x/%08x DDIPW=%08x PCS_AUX=%08x TX_AUX2=%08x TX_AUX5=%08x TX_AUX7=%08x CL_DW12=%08x PIPECONF_B=%08x PLANE_B=%08x DBOX_B=%08x STAT_B=%08x AUX_CTL_B=%08x\n",
+		  tag, rd(0x46000), rd(0x46070), rd(0x45440), rd(0x45444), rd(0x45454), rd(0x6C304), rd(0x6C388), rd(0x6C394), rd(0x6C39C),
+		  rd(0x6C030), rd(0x71008), rd(0x71180), rd(0x7103C), rd(0x71058), rd(0x64110));
+}
 // NP550 USB-C DP: a Apple grava LINK_BW/LANE_COUNT (0x100), DOWNSPREAD (0x107) e TPS1 (0x102) no DPCD antes de ligar a
 // DDI; o hub recebe "treinar" sem sinal e para de responder ao AUX quando o link chega (HPD continua alto). O i915 liga
 // a DDI primeiro e só então grava 0x107 = 00 01, 0x100 e 0x102 = 21 00 00. Aqui essas gravações ficam guardadas e vão
@@ -4292,6 +4300,8 @@ IOReturn Gen11::wrapWriteAUX(void *that, uint32_t address, void *buffer, uint32_
 		bool ddiOn = NGreen::callback && (NGreen::callback->readReg32(0x64100) & 0x80000000u);
 		if (address == 0x100 && length >= 2) {
 			dpbPrepTraining(b[0], b[1] & 0x1F);
+			static int nd = 0;
+			if (nd++ < 3) dpbStateDump("antes");
 			if (!ddiOn) { gDpbBw = b[0]; gDpbLc = b[1]; gDpbHold = true; return kIOReturnSuccess; }
 		} else if (gDpbHold && !ddiOn && (address == 0x107 || (address == 0x102 && length == 1 && b[0] == 0x21))) {
 			return kIOReturnSuccess;
@@ -4380,6 +4390,7 @@ IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint3
 			static int ne = 0;
 			if (retVal && ne++ < 12) {
 				auto rd = [](uint32_t r) { return NGreen::callback->readReg32(r); };
+				if (ne <= 3) dpbStateDump("falha");
 				IOLog("XeNG DPB auxerr AUX_CTL_B=%08x SDEISR=%08x SDEIIR=%08x SHOTPLUG_DDI=%08x DP_TP_ST_B=%08x DDI_BUF_B=%08x TP_B=%08x FUNC_B=%08x PIPE_B_IIR=%08x\n",
 					  rd(0x64110), rd(0xC4000), rd(0xC4008), rd(0xC4030), rd(0x61544), rd(0x64100), rd(0x61540), rd(0x61400), rd(0x44418));
 			}
