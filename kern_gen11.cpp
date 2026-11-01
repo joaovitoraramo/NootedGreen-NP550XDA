@@ -6828,6 +6828,15 @@ unsigned long Gen11::start(void *that,void  *param_1)
 	}
 	} else {
 		SYSLOG("ngreen", "V52: Real TGL — skipping MultiForceWakeSelect override");
+		// NP550 (01/11): XE-GVAID/XE-GVAHEVC também no TGL real com -ngreengva. Sem elas o anúncio IOGVA* da personality
+		// fica, o AppleGVA procura o plugin VA, recusa o ID (personality 0x1080040, plugin 0x1080080) e todo vídeo
+		// (inclusive o protetor Aerial 4K) é decodificado na CPU (VTDecoderXPCService a 300%). Plugin: macos/vadriver do XPS.
+		if (checkKernelArgument("-ngreengva")) {
+			auto *rid = OSNumber::withNumber(0x1080080ULL, 32);
+			if (rid) { service->setProperty("IOVARendererID", rid); rid->release(); }
+			service->setProperty("IOGVAHEVCDecode", "2");
+			SYSLOG("ngreen", "XE-GVAID/XE-GVAHEVC (TGL real): IOVARendererID = 0x1080080, IOGVAHEVCDecode = \"2\"");
+		}
 	}
 
 	// ── V29: Apply GT workarounds + GGTT PTE diagnostics ──
