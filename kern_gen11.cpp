@@ -12964,7 +12964,8 @@ bool Gen11::wrapIGScheduler5IsGpuIdle(const void *that) {
 	if (!idle) {
 		uint32_t instdone = NGreen::callback->readReg32(RING_INSTDONE(RENDER_RING_BASE));
 		if ((instdone & ~1U) == 0xfffffffe) {
-			SYSLOG("ngreen", "V212[5]: isGpuIdle override INSTDONE=0x%08x → idle", instdone);
+			static uint32_t n = 0;  // limitado: em polling chega a ~100/s e apagava o resto do dmesg
+			if (++n <= 20 || n % 1000 == 0) SYSLOG("ngreen", "V212[5]: isGpuIdle override INSTDONE=0x%08x → idle (n=%u)", instdone, n);
 			return true;
 		}
 	}
@@ -12976,7 +12977,8 @@ bool Gen11::wrapIGScheduler4IsGpuIdle(const void *that) {
 	if (!idle) {
 		uint32_t instdone = NGreen::callback->readReg32(RING_INSTDONE(RENDER_RING_BASE));
 		if ((instdone & ~1U) == 0xfffffffe) {
-			SYSLOG("ngreen", "V212[4]: isGpuIdle override INSTDONE=0x%08x → idle", instdone);
+			static uint32_t n = 0;  // limitado: em polling chega a ~100/s e apagava o resto do dmesg
+			if (++n <= 20 || n % 1000 == 0) SYSLOG("ngreen", "V212[4]: isGpuIdle override INSTDONE=0x%08x → idle (n=%u)", instdone, n);
 			return true;
 		}
 	}
