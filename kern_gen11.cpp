@@ -4831,7 +4831,7 @@ static uint32_t xeFenceFilterWrite(uint32_t r, uint32_t val) {
 // NP550 USB-C DP: a tabela de sinal da Apple para o PHY combo B (swing 6, N 0x7f, RTERM 0, cursor 0x18) deixa a lane 0
 // sem clock recovery no hub USB-C. Troca, na gravação, pelos valores que o i915 usa e que treinam HBR2 x2 neste
 // notebook (dump no Linux com o hub aceso): TX_DW2 0xa098, TX_DW4 0x28003f (+LOADGEN nas lanes 1-2), TX_DW5
-// 0x20290030 (+TX_TRAINING_EN da Apple), TX_DW7 N 0x47, PCS_DW1 sem DCC contínuo. Grupos (0x6C6xx) e lanes (0x6C8xx+).
+// 0x20290030 (+TX_TRAINING_EN da Apple), TX_DW7 N 0x47, TX_DW8 ODCC_CLK_SEL, PCS_DW1 sem DCC contínuo. Grupos (0x6C6xx) e lanes (0x6C8xx+).
 static uint32_t dpbPhyFix(uint32_t r, uint32_t val) {
 	if (r < 0x6C600 || r >= 0x6CC00) return val;
 	uint32_t off = r - 0x6C000;
@@ -4848,7 +4848,17 @@ static uint32_t dpbPhyFix(uint32_t r, uint32_t val) {
 		if (grp ? (val & 0x80000000u) : (ln == 1 || ln == 2)) nv |= 0x80000000u;
 	} else if (tx && d == 5) nv = (val & 0x80000000u) | 0x20290030u;
 	else if (tx && d == 7) nv = (val & ~0x7F000000u) | 0x47000000u;
-	else if (pcs && d == 1) nv = val & ~0x00300000u;
+	else if (tx && d == 8) nv = (val & ~0xE0000000u) | 0xA0000000u;
+	else if (pcs && d == 1) {
+		nv = val & ~0x00300000u;
+		// i915 (TGL): antes do DCC "run once", ODCC_CLK_SEL + DIV2 no TX_DW8 das 4 lanes; a Apple deixa o CLK_SEL em 0.
+		if (NGreen::callback) {
+			for (uint32_t l = 0; l < 4; l++) {
+				uint32_t a = 0x6C8A0 + l * 0x100, o = NGreen::callback->readReg32(a);
+				if ((o & 0xE0000000u) != 0xA0000000u) NGreen::callback->writeReg32(a, (o & ~0xE0000000u) | 0xA0000000u);
+			}
+		}
+	}
 	if (nv != val) { static int n = 0; if (n++ < 40) IOLog("XeNG DPB phy %05x %08x -> %08x\n", r, val, nv); }
 	// A Apple não grava o TX_DW7 (fica 0x7f do reset): grava o N scalar nas 4 lanes junto com o TX_DW5, como o i915.
 	if (tx && d == 5 && NGreen::callback) {
