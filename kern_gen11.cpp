@@ -4225,7 +4225,9 @@ static void dpbPrepTraining(uint8_t bw, uint8_t lanes) {
 	const uint32_t cfg0 = 0x00E001A5;    // DCO 8100 MHz
 	uint32_t clka = rd(0x164280);
 	bool pll = rd(0x16428C) != cfg0 || rd(0x164290) != cfg1 || !(rd(0x46014) & 0x40000000u);
-	if (pll && (clka & 0xCu) == 0x4u) {  // DDI B -> DPLL1
+	static int np = -1;
+	if (np < 0) np = checkKernelArgument("-ngreendpbnopll") ? 1 : 0;
+	if (pll && !np && (clka & 0xCu) == 0x4u) {  // DDI B -> DPLL1
 		wr(0x164280, clka | 0x800u);     // clock da DDI B desligado durante a troca
 		wr(0x46014, rd(0x46014) & ~0x80000000u);
 		for (int i = 0; i < 100 && (rd(0x46014) & 0x40000000u); i++) IODelay(10);
@@ -4240,10 +4242,15 @@ static void dpbPrepTraining(uint8_t bw, uint8_t lanes) {
 		for (int i = 0; i < 100 && !(rd(0x46014) & 0x40000000u); i++) IODelay(10);
 		wr(0x164280, clka);
 	}
-	wr(0x46144, 0x20000000u);
+	// Transcoder antes do treino: com ele, o AUX da DDI B dá timeout durante o TPS1 (teste 31/10); só com -ngreendpbtrans.
+	static int tr = -1;
+	if (tr < 0) tr = checkKernelArgument("-ngreendpbtrans") ? 1 : 0;
 	uint32_t f = rd(0x61400);
-	uint32_t nf = (f & ~(0x7F000000u | 0xEu)) | 0x10000000u | 0x02000000u | (((uint32_t)(lanes ? lanes : 1) - 1) << 1);
-	if (nf != f) wr(0x61400, nf);
+	if (tr) {
+		wr(0x46144, 0x20000000u);
+		uint32_t nf = (f & ~(0x7F000000u | 0xEu)) | 0x10000000u | 0x02000000u | (((uint32_t)(lanes ? lanes : 1) - 1) << 1);
+		if (nf != f) wr(0x61400, nf);
+	}
 	static int n = 0;
 	if (n++ < 20) IOLog("XeNG DPB prep bw=%02x lanes=%u pll=%d DPLL1=%08x %08x %08x CLKA=%08x CLKSEL_B=%08x FUNC_B=%08x -> %08x\n",
 						bw, lanes, pll, rd(0x46014), rd(0x16428C), rd(0x164290), rd(0x164280), rd(0x46144), f, rd(0x61400));
