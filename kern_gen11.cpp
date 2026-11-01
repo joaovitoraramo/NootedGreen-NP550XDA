@@ -4241,6 +4241,17 @@ IOReturn Gen11::wrapWriteAUX(void *that, uint32_t address, void *buffer, uint32_
 				}
 				IOLog("XeNG DPB PHYB grp PCS_DW1=%08x TX_DW2=%08x TX_DW4=%08x TX_DW5=%08x TX_DW7=%08x\n",
 					  rd(0x6C604), rd(0x6C688), rd(0x6C690), rd(0x6C694), rd(0x6C69C));
+				// Primeira falha: PHY B inteiro (comum + lanes), para comparar com o dump do Linux.
+				if (nd == 1) {
+					static const uint32_t rg[][2] = {{0x6C000, 0x6C200}, {0x6C800, 0x6CC00}};
+					for (auto &g : rg) {
+						for (uint32_t a = g[0]; a < g[1]; a += 0x20) {
+							uint32_t v[8]; bool any = false;
+							for (int i = 0; i < 8; i++) { v[i] = rd(a + i * 4); any |= v[i] != 0 && v[i] != 0xFFFFFFFFu; }
+							if (any) IOLog("XeNG DPB PHYX %05x %08x %08x %08x %08x %08x %08x %08x %08x\n", a, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+						}
+					}
+				}
 			}
 			lastTp = b[0];
 		}
@@ -4839,6 +4850,13 @@ static uint32_t dpbPhyFix(uint32_t r, uint32_t val) {
 	else if (tx && d == 7) nv = (val & ~0x7F000000u) | 0x47000000u;
 	else if (pcs && d == 1) nv = val & ~0x00300000u;
 	if (nv != val) { static int n = 0; if (n++ < 40) IOLog("XeNG DPB phy %05x %08x -> %08x\n", r, val, nv); }
+	// A Apple não grava o TX_DW7 (fica 0x7f do reset): grava o N scalar nas 4 lanes junto com o TX_DW5, como o i915.
+	if (tx && d == 5 && NGreen::callback) {
+		for (uint32_t l = 0; l < 4; l++) {
+			uint32_t a = 0x6C89C + l * 0x100, o = NGreen::callback->readReg32(a);
+			if ((o & 0x7F000000u) != 0x47000000u) NGreen::callback->writeReg32(a, (o & ~0x7F000000u) | 0x47000000u);
+		}
+	}
 	return nv;
 }
 static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
