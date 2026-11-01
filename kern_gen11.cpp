@@ -4206,7 +4206,54 @@ static bool hdmiEmuPort(void *that) {
 	auto *cfg = getMember<uint32_t *>(that, 0x548);
 	return cfg && cfg[0] == kHdmiEmuDdi;
 }
+// NP550 USB-C DP: a Apple segue a ordem do ICL (treina o link e só depois seleciona o clock do transcoder e configura o
+// TRANS_DDI_FUNC_CTL), mas no TGL o DP_TP_CTL fica no transcoder; e ela nunca programa o DPLL1 (fica 018001d4/2644 do
+// firmware). Antes do treino (gravação do LINK_BW_SET no DPCD), faz como o i915: DPLL1 na taxa pedida (valores do Linux,
+// ref 19.2 MHz), TRANS_CLK_SEL_B = DDI B e FUNC_CTL_B com DDI B, DP SST e a largura (sem ligar o transcoder).
+static void dpbPrepTraining(uint8_t bw, uint8_t lanes) {
+	if (!NGreen::callback) return;
+	auto rd = [](uint32_t r) { return NGreen::callback->readReg32(r); };
+	auto wr = [](uint32_t r, uint32_t v) { NGreen::callback->writeReg32(r, v); };
+	uint32_t cfg1;
+	switch (bw) {
+		case 0x06: cfg1 = 0x90; break;   // RBR: pdiv 5, kdiv 2
+		case 0x0A: cfg1 = 0x88; break;   // HBR: pdiv 3, kdiv 2
+		case 0x14: cfg1 = 0x48; break;   // HBR2: pdiv 3, kdiv 1
+		case 0x1E: cfg1 = 0x44; break;   // HBR3: pdiv 2, kdiv 1
+		default: return;
+	}
+	const uint32_t cfg0 = 0x00E001A5;    // DCO 8100 MHz
+	uint32_t clka = rd(0x164280);
+	bool pll = rd(0x16428C) != cfg0 || rd(0x164290) != cfg1 || !(rd(0x46014) & 0x40000000u);
+	if (pll && (clka & 0xCu) == 0x4u) {  // DDI B -> DPLL1
+		wr(0x164280, clka | 0x800u);     // clock da DDI B desligado durante a troca
+		wr(0x46014, rd(0x46014) & ~0x80000000u);
+		for (int i = 0; i < 100 && (rd(0x46014) & 0x40000000u); i++) IODelay(10);
+		if (!(rd(0x46014) & 0x08000000u)) {
+			wr(0x46014, rd(0x46014) | 0x08000000u);
+			for (int i = 0; i < 100 && !(rd(0x46014) & 0x04000000u); i++) IODelay(10);
+		}
+		wr(0x16428C, cfg0);
+		wr(0x164290, cfg1);
+		(void)rd(0x164290);
+		wr(0x46014, rd(0x46014) | 0x80000000u);
+		for (int i = 0; i < 100 && !(rd(0x46014) & 0x40000000u); i++) IODelay(10);
+		wr(0x164280, clka);
+	}
+	wr(0x46144, 0x20000000u);
+	uint32_t f = rd(0x61400);
+	uint32_t nf = (f & ~(0x7F000000u | 0xEu)) | 0x10000000u | 0x02000000u | (((uint32_t)(lanes ? lanes : 1) - 1) << 1);
+	if (nf != f) wr(0x61400, nf);
+	static int n = 0;
+	if (n++ < 20) IOLog("XeNG DPB prep bw=%02x lanes=%u pll=%d DPLL1=%08x %08x %08x CLKA=%08x CLKSEL_B=%08x FUNC_B=%08x -> %08x\n",
+						bw, lanes, pll, rd(0x46014), rd(0x16428C), rd(0x164290), rd(0x164280), rd(0x46144), f, rd(0x61400));
+}
 IOReturn Gen11::wrapWriteAUX(void *that, uint32_t address, void *buffer, uint32_t length) {
+	if (address == 0x100 && length >= 2 && buffer && gDpBLinked && hdmiEmuOn() && that) {
+		auto *c = getMember<uint32_t *>(that, 0x548);
+		auto *b = reinterpret_cast<uint8_t *>(buffer);
+		if (c && c[0] == 1) dpbPrepTraining(b[0], b[1] & 0x1F);
+	}
 	if (hdmiEmuPort(that)) {
 		hdmiEmuInit();
 		auto *b = reinterpret_cast<uint8_t *>(buffer);
