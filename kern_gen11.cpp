@@ -4268,7 +4268,14 @@ IOReturn Gen11::wrapWriteAUX(void *that, uint32_t address, void *buffer, uint32_
 	if (address == 0x100 && length >= 2 && buffer && gDpBLinked && hdmiEmuOn() && that) {
 		auto *c = getMember<uint32_t *>(that, 0x548);
 		auto *b = reinterpret_cast<uint8_t *>(buffer);
-		if (c && c[0] == 1) dpbPrepTraining(b[0], b[1] & 0x1F);
+		if (c && c[0] == 1) {
+			dpbPrepTraining(b[0], b[1] & 0x1F);
+			// i915: MAIN_LINK_CHANNEL_CODING_SET (0x108) = 8b/10b junto com o DOWNSPREAD (0x107); a Apple só grava o 0x107.
+			uint8_t one = 1;
+			IOReturn r8 = FunctionCast(wrapWriteAUX, callback->oWriteAUX)(that, 0x108, &one, 1);
+			static int n = 0;
+			if (n++ < 10) IOLog("XeNG DPB writeAUX 0x00108 <- 01 -> 0x%x\n", r8);
+		}
 	}
 	if (hdmiEmuPort(that)) {
 		hdmiEmuInit();
@@ -4347,6 +4354,12 @@ IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint3
 			if (n++ < 120) IOLog("XeNG DPB readAUX 0x%05x len=%u -> 0x%x: %02x %02x %02x %02x %02x %02x %02x %02x\n", address, length, retVal,
 								 b && length ? b[0] : 0, b && length > 1 ? b[1] : 0, b && length > 2 ? b[2] : 0, b && length > 3 ? b[3] : 0,
 								 b && length > 4 ? b[4] : 0, b && length > 5 ? b[5] : 0, b && length > 6 ? b[6] : 0, b && length > 7 ? b[7] : 0);
+			static int ne = 0;
+			if (retVal && ne++ < 12) {
+				auto rd = [](uint32_t r) { return NGreen::callback->readReg32(r); };
+				IOLog("XeNG DPB auxerr AUX_CTL_B=%08x SDEISR=%08x SHOTPLUG_DDI=%08x DP_TP_ST_B=%08x DDI_BUF_B=%08x TP_B=%08x FUNC_B=%08x PIPE_B_IIR=%08x\n",
+					  rd(0x64110), rd(0xC4008), rd(0xC4030), rd(0x61544), rd(0x64100), rd(0x61540), rd(0x61400), rd(0x44418));
+			}
 		}
 	}
 
