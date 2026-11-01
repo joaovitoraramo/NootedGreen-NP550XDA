@@ -4264,29 +4264,39 @@ static void dpbPrepTraining(uint8_t bw, uint8_t lanes) {
 	if (n++ < 20) IOLog("XeNG DPB prep bw=%02x lanes=%u pll=%d DPLL1=%08x %08x %08x CLKA=%08x CLKSEL_B=%08x FUNC_B=%08x -> %08x DDI_PW=%08x/%08x SDEISR=%08x\n",
 						bw, lanes, pll, rd(0x46014), rd(0x16428C), rd(0x164290), rd(0x164280), rd(0x46144), f, rd(0x61400), rd(0x45400), rd(0x45404), rd(0xC4000));
 }
+// NP550 USB-C DP: a Apple grava LINK_BW/LANE_COUNT (0x100), DOWNSPREAD (0x107) e TPS1 (0x102) no DPCD antes de ligar a
+// DDI; o hub recebe "treinar" sem sinal e para de responder ao AUX quando o link chega (HPD continua alto). O i915 liga
+// a DDI primeiro e só então grava 0x107 = 00 01, 0x100 e 0x102 = 21 00 00. Aqui essas gravações ficam guardadas e vão
+// na ordem do i915 na primeira transação AUX com a DDI B ligada.
+static volatile bool gDpbHold = false;
+static uint8_t gDpbBw = 0, gDpbLc = 0;
+static bool dpbPortB(void *that) {
+	if (!that || !gDpBLinked || !hdmiEmuOn()) return false;
+	auto *c = getMember<uint32_t *>(that, 0x548);
+	return c && c[0] == 1;
+}
+void Gen11::dpbFlushHeld(void *that) {
+	if (!gDpbHold || !NGreen::callback || !(NGreen::callback->readReg32(0x64100) & 0x80000000u)) return;
+	gDpbHold = false;
+	auto wr = FunctionCast(wrapWriteAUX, callback->oWriteAUX);
+	uint8_t ds[2] = {0x00, 0x01}, bw[2] = {gDpbBw, gDpbLc}, tp[3] = {0x21, 0x00, 0x00};
+	IOReturn r1 = wr(that, 0x107, ds, 2);
+	IOReturn r2 = wr(that, 0x100, bw, 2);
+	IOReturn r3 = wr(that, 0x102, tp, 3);
+	static int n = 0;
+	if (n++ < 10) IOLog("XeNG DPB DPCD na ordem do i915: 0x107 00 01 -> 0x%x, 0x100 %02x %02x -> 0x%x, 0x102 21 00 00 -> 0x%x\n", r1, gDpbBw, gDpbLc, r2, r3);
+}
 IOReturn Gen11::wrapWriteAUX(void *that, uint32_t address, void *buffer, uint32_t length) {
-	if (address == 0x100 && length >= 2 && buffer && gDpBLinked && hdmiEmuOn() && that) {
-		auto *c = getMember<uint32_t *>(that, 0x548);
+	if (buffer && dpbPortB(that)) {
 		auto *b = reinterpret_cast<uint8_t *>(buffer);
-		if (c && c[0] == 1) {
+		bool ddiOn = NGreen::callback && (NGreen::callback->readReg32(0x64100) & 0x80000000u);
+		if (address == 0x100 && length >= 2) {
 			dpbPrepTraining(b[0], b[1] & 0x1F);
-			// i915: MAIN_LINK_CHANNEL_CODING_SET (0x108) = 8b/10b junto com o DOWNSPREAD (0x107); a Apple só grava o 0x107.
-			uint8_t one = 1;
-			IOReturn r8 = FunctionCast(wrapWriteAUX, callback->oWriteAUX)(that, 0x108, &one, 1);
-			static int n = 0;
-			if (n++ < 10) IOLog("XeNG DPB writeAUX 0x00108 <- 01 -> 0x%x\n", r8);
-		}
-	}
-	// NP550 USB-C DP: TRAINING_PATTERN_SET com os TRAINING_LANEx_SET zerados na mesma transação, como o i915 (a Apple
-	// grava só o 0x102 e as lanes ficam com o "swing máximo atingido" da tentativa anterior).
-	if (address == 0x102 && length == 1 && buffer && *reinterpret_cast<uint8_t *>(buffer) == 0x21 && gDpBLinked && hdmiEmuOn() && that) {
-		auto *c = getMember<uint32_t *>(that, 0x548);
-		if (c && c[0] == 1) {
-			uint8_t tp[3] = {0x21, 0, 0};
-			IOReturn r = FunctionCast(wrapWriteAUX, callback->oWriteAUX)(that, 0x102, tp, 3);
-			static int n = 0;
-			if (n++ < 10) IOLog("XeNG DPB writeAUX 0x00102 <- 21 00 00 -> 0x%x\n", r);
-			return r;
+			if (!ddiOn) { gDpbBw = b[0]; gDpbLc = b[1]; gDpbHold = true; return kIOReturnSuccess; }
+		} else if (gDpbHold && !ddiOn && (address == 0x107 || (address == 0x102 && length == 1 && b[0] == 0x21))) {
+			return kIOReturnSuccess;
+		} else if (gDpbHold && ddiOn) {
+			callback->dpbFlushHeld(that);
 		}
 	}
 	if (hdmiEmuPort(that)) {
@@ -4357,6 +4367,7 @@ IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint3
 		return kIOReturnSuccess;
 	}
 
+	if (gDpbHold && dpbPortB(that)) callback->dpbFlushHeld(that);
 	IOReturn retVal = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that, address, buffer, length);
 	{
 		auto *cfg = (that && hpdTraceOn()) ? getMember<uint32_t *>(that, 0x548) : nullptr;

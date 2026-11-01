@@ -1555,6 +1555,7 @@ private:
 	
 	static IOReturn wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint32_t length);
 	static IOReturn wrapWriteAUX(void *that, uint32_t address, void *buffer, uint32_t length);   // NP550 HDMIEMU
+	static void dpbFlushHeld(void *that);   // NP550 USB-C DP: DPCD do treino na ordem do i915
 	mach_vm_address_t oWriteAUX {};
 	static IOReturn wrapRunAUXCommand(void *that, uint32_t cmd, uint32_t *data, uint32_t len, bool flag);   // NP550 AUXTRACE
 	mach_vm_address_t oRunAUXCommand {};
