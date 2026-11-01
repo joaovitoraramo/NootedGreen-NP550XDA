@@ -4148,6 +4148,16 @@ static uint64_t fliT_CfgVBL(void *that, void *fb, void *path, bool en, bool b) {
 // NP550 AUXTRACE (-ngreenauxtrace): pilha de quem chama runAUXCommand nas ddi 3 (HDMI TC1) e 7, em offsets do
 // binário do FB (slide calculado por _gPlatformInformationList, estático 0x%llx em ngreenauxbase=...).
 IOReturn Gen11::wrapRunAUXCommand(void *that, uint32_t cmd, uint32_t *data, uint32_t len, bool flag) {
+	// NP550 (01/11): no login o FB faz ~150 AUX/s na "ddi 7" (porta do 3º conector, sem AUX físico), cada um com timeout
+	// de ~6 ms: 2240 timeouts em 16 s e o WindowServer parado 7,4 s ("Render::Server callback delayed"). Responde na hora.
+	if (that && !checkKernelArgument("-ngreenaux7")) {
+		auto *cfg = getMember<uint32_t *>(that, 0x548);
+		if (cfg && cfg[0] == 7) {
+			static int n = 0;
+			if (++n <= 3 || (n & 1023) == 0) IOLog("XeNG AUX7 #%d cmd=0x%x len=%u -> timeout imediato\n", n, cmd, len);
+			return kIOReturnTimeout;
+		}
+	}
 	static int on = -1;
 	if (on < 0) on = checkKernelArgument("-ngreenauxtrace") ? 1 : 0;
 	if (on && that) {
