@@ -1326,8 +1326,6 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN14AppleIntelPort8writeAUXEjPvj", wrapWriteAUX, this->oWriteAUX},
 			// NP550 (-ngreenauxtrace): quem chama o AUX nas portas sem DP (HDMI legado na TC1 = ddi 3).
 			{"__ZN17AppleIntelPortHAL13runAUXCommandEN14AppleIntelPort11AUX_CommandEPjjb", wrapRunAUXCommand, this->oRunAUXCommand},
-			// NP550 USB-C DP: largura/taxa do link para a lista de modos (lia DDI_BUF_CTL com a DDI desligada -> 1 lane, 30 Hz).
-			{"__ZN21AppleIntelDisplayPath13getLinkConfigEP16IOFBDPLinkConfig", wrapPathGetLinkConfig, this->oPathGetLinkConfig},
 			{"__ZN24AppleIntelBaseController20invokeHotplugHandlerEjN14AppleIntelPort8PortModeE", wrapInvokeHotplug, this->oInvokeHotplug},
 			{"__ZN17AppleIntelPortHAL11setPortModeEN14AppleIntelPort8PortModeE", wrapHalSetPortMode, this->oHalSetPortMode},
 			{"__ZN14AppleIntelPort11getDDCBlockEjPhb", wrapPortGetDDCBlock, this->oPortGetDDCBlock},
@@ -3784,7 +3782,21 @@ static uint64_t agdcT_doLinkTraining(void *that, uint32_t *a, uint32_t *b) {
 	// NP550 USB-C (DDI B, combo PHY, porta AGDC 2, DP pelo mux do PD): no hotplug o AGDC treina o link antes de existir
 	// display path para a porta, e o AppleIntelPort::linkTraining desiste ("Port is not associated to any path"). O path
 	// só nasce no modeset (allocateDisplayResources), cujo LightUpDP treina de novo, aí com path. Responde sucesso aqui.
-	if (hdmiEmuOn() && a && a[0] == 2) gDpBLinked = true;
+	if (hdmiEmuOn() && a && a[0] == 2) {
+		gDpBLinked = true;
+		// AppleIntelDisplayPath::getLinkConfig tira o laneCount da largura em DDI_BUF_CTL da porta (+1) e não grava a taxa
+		// ("Bringup TODO"). No hotplug a DDI B está desligada (0x80) -> 1 lane -> a lista de modos do FB1 só tinha 30 Hz
+		// (74,25 MHz, cursor "travado"). Deixa a largura x2 (bits 3:1 = 001) gravada com a DDI desligada: inofensivo e
+		// a lista passa a 2 lanes. (Rotear o getLinkConfig travou o boot na maçã em 01/11 — não repetir.)
+		if (NGreen::callback) {
+			uint32_t v = NGreen::callback->readReg32(0x64100);
+			if (!(v & 0x80000000u) && (v & 0xEu) != 0x2u) {
+				NGreen::callback->writeReg32(0x64100, (v & ~0xEu) | 0x2u);
+				static int n = 0;
+				if (n++ < 10) IOLog("XeNG DPB DDI_BUF_CTL_B %08x -> %08x (largura x2 para a lista de modos)\n", v, NGreen::callback->readReg32(0x64100));
+			}
+		}
+	}
 	if (hdmiEmuOn() && a && a[0] == 2 && ((r & 0xFFFFFFFF) || (b && b[0x38 / 4]))) {
 		static int n = 0;
 		if (n++ < 10) IOLog("XeNG DPB doLinkTraining porta 2: original 0x%llx status=0x%x in=%08x %08x %08x %08x -> sucesso (treino real no LightUpDP)\n",
@@ -4149,26 +4161,6 @@ static uint64_t fliT_CfgVBL(void *that, void *fb, void *path, bool en, bool b) {
 
 // NP550 AUXTRACE (-ngreenauxtrace): pilha de quem chama runAUXCommand nas ddi 3 (HDMI TC1) e 7, em offsets do
 // binário do FB (slide calculado por _gPlatformInformationList, estático 0x%llx em ngreenauxbase=...).
-// NP550 USB-C DP (01/11): AppleIntelDisplayPath::getLinkConfig monta o IOFBDPLinkConfig com laneCount = largura lida em
-// DDI_BUF_CTL da porta (+1) e nunca grava bitRate ("Bringup TODO: implement link rate determination from HW values").
-// Na hora de montar a lista de modos a DDI B ainda está desligada -> 1 lane, taxa 0 -> o FB1 só oferecia 1080p a 30 Hz
-// (IOFBCurrentPixelClock 74,25 MHz, cursor "travado" nas duas telas). Na porta B com o hub treinado: 2 lanes, HBR2.
-IOReturn Gen11::wrapPathGetLinkConfig(void *that, IOFBDPLinkConfig *cfg) {
-	IOReturn r = FunctionCast(wrapPathGetLinkConfig, callback->oPathGetLinkConfig)(that, cfg);
-	if (cfg && that && gDpBLinked && hdmiEmuOn()) {
-		void *port = getMember<void *>(that, 0x3648);
-		auto *c = port ? getMember<uint32_t *>(port, 0x548) : nullptr;
-		if (c && c[0] == 1) {
-			uint8_t lanes = cfg->laneCount, rate = cfg->bitRate;
-			if (cfg->laneCount < 2) cfg->laneCount = 2;
-			if (cfg->bitRate < 0x14) cfg->bitRate = 0x14;
-			if (cfg->maxBitRate < 0x14) cfg->maxBitRate = 0x14;
-			static int n = 0;
-			if (n++ < 10) IOLog("XeNG DPB getLinkConfig: lanes %u -> %u, taxa 0x%02x -> 0x%02x, max 0x%02x, r=0x%x\n", lanes, cfg->laneCount, rate, cfg->bitRate, cfg->maxBitRate, r);
-		}
-	}
-	return r;
-}
 IOReturn Gen11::wrapRunAUXCommand(void *that, uint32_t cmd, uint32_t *data, uint32_t len, bool flag) {
 	// NP550 (01/11): no login o FB faz ~150 AUX/s na "ddi 7" (porta do 3º conector, sem AUX físico), cada um com timeout
 	// de ~6 ms: 2240 timeouts em 16 s e o WindowServer parado 7,4 s ("Render::Server callback delayed"). Responde na hora.
@@ -5048,6 +5040,7 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 		// NP550 HDMIOUT: com a saída HDMI acesa, o caminho DP da Apple desfaz o que não reconhece (desliga o buffer da DDI D,
 		// o IO da TC1...) e põe o DDB do pipe B por cima do pipe A e na fatia S2 desligada (underrun = faixas no painel).
 		if (gDpBLinked && hdmiEmuOn()) val = dpbPhyFix(r, val);
+		if (r == 0x64100 && gDpBLinked && hdmiEmuOn() && !(val & 0x80000000u)) val = (val & ~0xEu) | 0x2u;   // largura x2 mesmo desligada
 		if (r == 0x45444 && gDpBLinked && hdmiEmuOn()) val |= 0xAu;   // AUX A/B ligados enquanto o DP do USB-C existe
 		// NP550 USB-C DP: a Apple liga o enhanced framing no DPCD (LANE_COUNT_SET 0x82) mas não no DP_TP_CTL do TGL.
 		if (r == 0x61540 && gDpBLinked && hdmiEmuOn() && (val & 0x80000000u)) val |= 0x00040000u;

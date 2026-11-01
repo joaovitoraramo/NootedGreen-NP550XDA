@@ -1559,8 +1559,6 @@ private:
 	mach_vm_address_t oWriteAUX {};
 	static IOReturn wrapRunAUXCommand(void *that, uint32_t cmd, uint32_t *data, uint32_t len, bool flag);   // NP550 AUXTRACE
 	mach_vm_address_t oRunAUXCommand {};
-	static IOReturn wrapPathGetLinkConfig(void *that, IOFBDPLinkConfig *cfg);   // NP550 USB-C DP: lanes/taxa da lista de modos
-	mach_vm_address_t oPathGetLinkConfig {};
 	// NP550 HPDTRACE (-ngreenhpdtrace): cadeia do hotplug do HDMI legado (TC1)
 	static uint64_t wrapInvokeHotplug(void *that, uint32_t port, uint32_t mode);
 	static uint64_t wrapHalSetPortMode(void *that, uint32_t mode);
