@@ -4242,9 +4242,18 @@ static void dpbPrepTraining(uint8_t bw, uint8_t lanes) {
 		for (int i = 0; i < 100 && !(rd(0x46014) & 0x40000000u); i++) IODelay(10);
 		wr(0x164280, clka);
 	}
-	// Transcoder antes do treino: com ele, o AUX da DDI B dá timeout durante o TPS1 (teste 31/10); só com -ngreendpbtrans.
+	// Power wells 2 e 3 (PWR_WELL_CTL2: pedido bits 3/5, estado bits 2/4): o transcoder e o pipe B ficam no PW3, que depende
+	// do PW2. O i915 pede os dois antes do treino (0x45404 = 0x2f no Linux).
+	for (uint32_t pw = 0; pw < 2; pw++) {
+		uint32_t req = 0x8u << (pw * 2), st = 0x4u << (pw * 2);
+		if (!(rd(0x45404) & st)) {
+			wr(0x45404, rd(0x45404) | req);
+			for (int i = 0; i < 100 && !(rd(0x45404) & st); i++) IODelay(10);
+		}
+	}
+	// Transcoder antes do treino, como o i915 (-ngreendpbnotrans desliga).
 	static int tr = -1;
-	if (tr < 0) tr = checkKernelArgument("-ngreendpbtrans") ? 1 : 0;
+	if (tr < 0) tr = checkKernelArgument("-ngreendpbnotrans") ? 0 : 1;
 	uint32_t f = rd(0x61400);
 	if (tr) {
 		wr(0x46144, 0x20000000u);
@@ -4252,8 +4261,8 @@ static void dpbPrepTraining(uint8_t bw, uint8_t lanes) {
 		if (nf != f) wr(0x61400, nf);
 	}
 	static int n = 0;
-	if (n++ < 20) IOLog("XeNG DPB prep bw=%02x lanes=%u pll=%d DPLL1=%08x %08x %08x CLKA=%08x CLKSEL_B=%08x FUNC_B=%08x -> %08x\n",
-						bw, lanes, pll, rd(0x46014), rd(0x16428C), rd(0x164290), rd(0x164280), rd(0x46144), f, rd(0x61400));
+	if (n++ < 20) IOLog("XeNG DPB prep bw=%02x lanes=%u pll=%d DPLL1=%08x %08x %08x CLKA=%08x CLKSEL_B=%08x FUNC_B=%08x -> %08x DDI_PW=%08x/%08x\n",
+						bw, lanes, pll, rd(0x46014), rd(0x16428C), rd(0x164290), rd(0x164280), rd(0x46144), f, rd(0x61400), rd(0x45400), rd(0x45404));
 }
 IOReturn Gen11::wrapWriteAUX(void *that, uint32_t address, void *buffer, uint32_t length) {
 	if (address == 0x100 && length >= 2 && buffer && gDpBLinked && hdmiEmuOn() && that) {
@@ -4900,12 +4909,26 @@ static uint32_t dpbPhyFix(uint32_t r, uint32_t val) {
 	bool pcs = grp ? (off >= 0x600 && off < 0x680) : (dw < 0x80);
 	uint32_t d = (dw & 0x7F) / 4;
 	uint32_t nv = val;
-	if (tx && d == 2) nv = (val & ~0xB8FFu) | 0xA098u;
+	// Nível de swing pedido pela Apple (o TX_DW2 dela vem antes do TRAINING_LANE_SET): 0x1098, 0x9870, 0x2800, 0x3098.
+	// Valores do i915 (trace no Linux: nível 0 swing 0xA/N 0x35, nível 1 swing 0xC/N 0x47); 2 e 3 da tabela HBR2 do TGL.
+	static const uint32_t kDw2[4] = {0x9098, 0xA098, 0xA098, 0x3098};
+	static const uint32_t kN[4] = {0x35, 0x47, 0x61, 0x7F};
+	static uint32_t lvl = 0;
+	if (tx && d == 2) {
+		switch (val & 0xFFFF) {
+			case 0x1098: lvl = 0; break;
+			case 0x9870: lvl = 1; break;
+			case 0x2800: lvl = 2; break;
+			case 0x3098: lvl = 3; break;
+			default: lvl = 1; break;
+		}
+		nv = (val & ~0xB8FFu) | kDw2[lvl];
+	}
 	else if (tx && d == 4) {
 		nv = (val & ~0x803FFFFFu) | 0x0028003Fu;
 		if (grp ? (val & 0x80000000u) : (ln == 1 || ln == 2)) nv |= 0x80000000u;
 	} else if (tx && d == 5) nv = (val & 0x80000000u) | 0x20290030u;
-	else if (tx && d == 7) nv = (val & ~0x7F000000u) | 0x47000000u;
+	else if (tx && d == 7) nv = (val & ~0x7F000000u) | (kN[lvl] << 24);
 	else if (tx && d == 8) nv = (val & ~0xE0000000u) | 0xA0000000u;
 	else if (pcs && d == 1) {
 		nv = val & ~0x00300000u;
@@ -4918,11 +4941,11 @@ static uint32_t dpbPhyFix(uint32_t r, uint32_t val) {
 		}
 	}
 	if (nv != val) { static int n = 0; if (n++ < 40) IOLog("XeNG DPB phy %05x %08x -> %08x\n", r, val, nv); }
-	// A Apple não grava o TX_DW7 (fica 0x7f do reset): grava o N scalar nas 4 lanes junto com o TX_DW5, como o i915.
-	if (tx && d == 5 && NGreen::callback) {
+	// A Apple não grava o TX_DW7 (fica 0x7f do reset): grava o N scalar do nível nas 4 lanes, como o i915.
+	if (tx && (d == 5 || d == 2) && NGreen::callback) {
 		for (uint32_t l = 0; l < 4; l++) {
 			uint32_t a = 0x6C89C + l * 0x100, o = NGreen::callback->readReg32(a);
-			if ((o & 0x7F000000u) != 0x47000000u) NGreen::callback->writeReg32(a, (o & ~0x7F000000u) | 0x47000000u);
+			if (((o >> 24) & 0x7F) != kN[lvl]) NGreen::callback->writeReg32(a, (o & ~0x7F000000u) | (kN[lvl] << 24));
 		}
 	}
 	return nv;
@@ -4935,14 +4958,8 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 		// NP550 HDMIOUT: com a saída HDMI acesa, o caminho DP da Apple desfaz o que não reconhece (desliga o buffer da DDI D,
 		// o IO da TC1...) e põe o DDB do pipe B por cima do pipe A e na fatia S2 desligada (underrun = faixas no painel).
 		if (gDpBLinked && hdmiEmuOn()) val = dpbPhyFix(r, val);
-		// NP550 USB-C DP: com o link de verdade em HBR2 o AUX da DDI B dá timeout durante o treino. Como o i915 (SKL+):
-		// TIME_OUT_MAX e 32 pulsos de sync/fast-wake no DP_AUX_CH_CTL_B.
-		if (r == 0x64110 && gDpBLinked && hdmiEmuOn() && (val & 0x80000000u)) {
-			uint32_t nv = (val & ~(0x0C000000u | 0x3FFu)) | 0x0C000000u | (31u << 5) | 31u;
-			static int n = 0;
-			if (n++ < 30) IOLog("XeNG DPB auxctl %08x -> %08x (antes %08x)\n", val, nv, NGreen::callback ? NGreen::callback->readReg32(0x64110) : 0);
-			val = nv;
-		}
+		// NP550 USB-C DP: a Apple liga o enhanced framing no DPCD (LANE_COUNT_SET 0x82) mas não no DP_TP_CTL do TGL.
+		if (r == 0x61540 && gDpBLinked && hdmiEmuOn() && (val & 0x80000000u)) val |= 0x00040000u;
 		if (gHdmiOutState == 2 && hdmiEmuOn()) val = hdmiOutKeep(r, val);
 		// NP550 pipe B em qualquer saída externa (HDMI ou DP do USB-C): a Apple põe o DDB dos planos do pipe B por cima do
 		// pipe A e/ou na fatia S2 desligada (underrun = faixas no painel). Liga a S2 e move o DDB do pipe B para ela.
