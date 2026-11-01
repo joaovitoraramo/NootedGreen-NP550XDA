@@ -4876,6 +4876,90 @@ static void xeBlDiagStart() {
 	if (gXeBlTimer) thread_call_enter_delayed(gXeBlTimer, d);
 }
 
+// ─── NP550 XE-PWR (01/11): limite de potência da CPU na tomada/bateria, guiado pela temperatura ───────────────────
+// O BIOS da Samsung deixa o PL1 do RAPL em MMIO (MCHBAR+0x59A0) em 10 W; no Windows o driver Intel DTT o sobe, no
+// macOS fica 10 W para sempre (8 threads a ~0,9 GHz). O MSR 0x610 já vem com PL1 40 / PL2 45 W e o efetivo é o menor
+// dos dois. Medido no Linux: PL1 28 W = 3,4 GHz sustentados a 86-88 °C (picos 93, TCC a 94 °C) com a pasta original.
+// Na tomada parte de ngreenpwrac (28 W, TDP nominal do i7-1165G7) e regula pela temperatura do pacote (MSR 0x1B1):
+// acima de ngreenpwrtemp+2 (87 °C) desce 2 W, abaixo de ngreenpwrtemp-3 (82 °C) sobe 1 W até o teto. Na bateria
+// PL1 ngreenpwrbat (15 W). PL2 45 W e tau do BIOS ficam (picos curtos). Reaplica a cada 2 s (o firmware pode rebaixar).
+// Desliga com -ngreennopwr. Estado em ioreg: propriedades xe-pwr-* no IOPCIDevice 0:0.0.
+static inline uint64_t xePwrRdmsr(uint32_t r) { uint32_t lo, hi; __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(r)); return ((uint64_t)hi << 32) | lo; }
+static thread_call_t gXePwrTimer = nullptr;
+static IOPCIDevice *gXePwrHost = nullptr;
+static IOMemoryMap *gXePwrMap = nullptr;
+static volatile uint32_t *gXePwrRapl = nullptr;   // MCHBAR+0x59A0 (low: PL1, high: PL2 + lock)
+static IOService *gXePwrBat = nullptr;
+static uint32_t gXePwrAc = 28, gXePwrBatW = 15, gXePwrTemp = 85, gXePwrCur = 0, gXePwrUnit = 8, gXePwrTj = 100;
+static int gXePwrLastAc = -1;
+static bool xePwrInit() {
+	OSDictionary *m = IOService::serviceMatching("IOPCIDevice");
+	OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr;
+	if (m) m->release();
+	if (it) {
+		while (OSObject *o = it->getNextObject()) {
+			auto *d = OSDynamicCast(IOPCIDevice, o);
+			if (d && d->getBusNumber() == 0 && d->getDeviceNumber() == 0 && d->getFunctionNumber() == 0) { gXePwrHost = d; d->retain(); break; }
+		}
+		it->release();
+	}
+	if (!gXePwrHost) { IOLog("XeNG PWR: host bridge 0:0.0 não encontrado\n"); return false; }
+	uint64_t mch = (((uint64_t)gXePwrHost->configRead32(0x4C) << 32) | gXePwrHost->configRead32(0x48));
+	if (!(mch & 1)) { IOLog("XeNG PWR: MCHBAR desligado (0x%llx)\n", mch); return false; }
+	mch &= ~0x7FFFULL;
+	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(mch + 0x5000, 0x1000, kIODirectionInOut);
+	if (md) { gXePwrMap = md->map(kIOMapInhibitCache); md->release(); }
+	if (!gXePwrMap) { IOLog("XeNG PWR: falha ao mapear MCHBAR 0x%llx\n", mch); return false; }
+	gXePwrRapl = reinterpret_cast<volatile uint32_t *>(gXePwrMap->getVirtualAddress() + 0x9A0);
+	gXePwrUnit = 1u << (xePwrRdmsr(0x606) & 0xF);   // unidades por watt
+	gXePwrTj = (uint32_t)((xePwrRdmsr(0x1A2) >> 16) & 0xFF);
+	uint32_t v;
+	if (PE_parse_boot_argn("ngreenpwrac", &v, sizeof(v)) && v >= 10 && v <= 45) gXePwrAc = v;
+	if (PE_parse_boot_argn("ngreenpwrbat", &v, sizeof(v)) && v >= 7 && v <= 45) gXePwrBatW = v;
+	if (PE_parse_boot_argn("ngreenpwrtemp", &v, sizeof(v)) && v >= 60 && v <= 95) gXePwrTemp = v;
+	IOLog("XeNG PWR: MCHBAR 0x%llx RAPL MMIO %08x %08x MSR610 %llx unit 1/%u W TjMax %u | tomada %u W, bateria %u W, alvo %u C\n",
+		  mch, gXePwrRapl[0], gXePwrRapl[1], xePwrRdmsr(0x610), gXePwrUnit, gXePwrTj, gXePwrAc, gXePwrBatW, gXePwrTemp);
+	return true;
+}
+static int xePwrOnAc() {
+	if (!gXePwrBat) {
+		OSDictionary *m = IOService::serviceMatching("AppleSmartBattery");
+		if (m) { gXePwrBat = IOService::copyMatchingService(m); m->release(); }
+		if (!gXePwrBat) return 1;   // sem bateria publicada: trata como tomada
+	}
+	auto *b = OSDynamicCast(OSBoolean, gXePwrBat->getProperty("ExternalConnected"));
+	return b ? (b->isTrue() ? 1 : 0) : 1;
+}
+static void xePwrTick() {
+	if (!gXePwrRapl) return;
+	uint32_t lo = gXePwrRapl[0], hi = gXePwrRapl[1];
+	if (hi & 0x80000000u) { static int n = 0; if (n++ < 3) IOLog("XeNG PWR: RAPL MMIO travado (%08x %08x)\n", lo, hi); return; }
+	int ac = xePwrOnAc();
+	uint32_t temp = gXePwrTj - (uint32_t)((xePwrRdmsr(0x1B1) >> 16) & 0x7F);
+	uint32_t teto = ac ? gXePwrAc : gXePwrBatW;
+	if (ac != gXePwrLastAc) { gXePwrCur = teto; gXePwrLastAc = ac; IOLog("XeNG PWR: %s -> PL1 %u W (temp %u C)\n", ac ? "tomada" : "bateria", teto, temp); }
+	else if (temp >= gXePwrTemp + 2 && gXePwrCur > 12) gXePwrCur = gXePwrCur >= 14 ? gXePwrCur - 2 : 12;
+	else if (temp + 3 <= gXePwrTemp && gXePwrCur < teto) gXePwrCur++;
+	if (gXePwrCur > teto) gXePwrCur = teto;
+	uint32_t raw = (gXePwrCur * gXePwrUnit) & 0x7FFF;
+	uint32_t nlo = (lo & ~0x7FFFu) | raw | 0x8000u;   // PL1 + enable; clamp/tau do BIOS ficam
+	if (nlo != lo) gXePwrRapl[0] = nlo;
+	if (gXePwrHost) {
+		gXePwrHost->setProperty("xe-pwr-pl1", gXePwrCur, 32);
+		gXePwrHost->setProperty("xe-pwr-temp", temp, 32);
+		gXePwrHost->setProperty("xe-pwr-ac", (uint32_t)ac, 32);
+	}
+}
+static void xePwrStart() {
+	if (gXePwrTimer || checkKernelArgument("-ngreennopwr")) return;
+	if (!xePwrInit()) return;
+	gXePwrTimer = thread_call_allocate([](thread_call_param_t, thread_call_param_t) {
+		xePwrTick();
+		uint64_t d; clock_interval_to_deadline(2, kSecondScale, &d); thread_call_enter_delayed(gXePwrTimer, d);
+	}, nullptr);
+	if (gXePwrTimer) thread_call_enter(gXePwrTimer);
+}
+
 static thread_call_t gXeBhTimer = nullptr;
 static void xeBootHoldRelease(const char *why) {   // write Apple's last CTL, re-arm with the current SURF, backlight back on
 	if (gXeBhDone) return;
@@ -6319,6 +6403,7 @@ bool Gen11::AppleIntelBaseControllerstart(AppleIntel::AppleIntelBaseController *
 	SYSLOG("ngreen", "FBController::start() entering...");
 	xeBootHoldInit();
 	xeBlDiagStart();
+	xePwrStart();
 	xeBootDiagDump("pre-FBstart");
 	auto ret=FunctionCast(AppleIntelBaseControllerstart, callback->oAppleIntelBaseControllerstart)(that,param_1 );
 	SYSLOG("ngreen", "FBController::start() returned %d", ret);
