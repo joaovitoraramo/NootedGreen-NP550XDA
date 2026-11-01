@@ -405,6 +405,7 @@ static void applyGmbusPinPatch(KernelPatcher &patcher, KernelPatcher::KextInfo *
 // retido esperando algo (provavelmente a conclusão da transação de display). Contadores no caminho de conclusão
 // (TGL: submit/isComplete/signalComplete/signalDisplayStampUpdate), com IOLog nas primeiras chamadas e a cada 64.
 static void xeEv(uint32_t tag, uint32_t a, uint32_t b, uint32_t c);
+static void xeGpuRecInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);  // xe/gpurec (portado do XPS)
 static uint8_t *volatile gAccelObj = nullptr;  // xe/csstate: IntelAccelerator (capturado em signalDisplayStampUpdate)
 static mach_vm_address_t gOrgDpSubmit = 0, gOrgDpIsComplete = 0, gOrgDpSignal = 0, gOrgDispStamp = 0;
 static volatile uint32_t gDpSubmitN = 0, gDpIsCompN = 0, gDpIsCompTrue = 0, gDpSignalN = 0, gDispStampN = 0;
@@ -2152,6 +2153,10 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				SYSLOG("ngreen", "FULL_MTL: forcing SafeForceWakeMultithreaded route despite coexist mode");
 			}
 		}
+
+		// xe/gpurec (XPS): restaura e reexecuta o irmão do domínio de reset de render (RCS <-> CCS) depois de um restart da GPU.
+		// No XPS fica só fora do TGL real; aqui é TGL real com o mesmo binário e escalonador host, então vale para os dois.
+		xeGpuRecInstall(patcher, index, address, size);
 
 		if (!wegCoexist) {
 			RouteRequestPlus gpuInfoRoute[] = {
@@ -13173,3 +13178,253 @@ void Gen11::endReset(void *that)
 //undefined8 __thiscall IntelAccelerator::stopGraphicsEngine(IntelAccelerator *this)
 //void __thiscall IGAccelSegmentResourceList::initBlitUsage(IGAccelSegmentResourceList *this)
 //ulong IntelAccelerator::submitBlit (blit3d_params_t *param_1,IGVector *param_2,IGAccelTask *param_3,bool param_4)
+
+// ─── Portado do XPS13Plus-IrisXe-Tahoe (XE-GPUREC v1+v2, 22-23/10) para o TGL real (01/11): mesmo binário 16.0.2
+// (resetGraphicsEngine 0x43576, initModeRegisters 0x28e1a), escalonador host (schedType=5, IGScheduler5).
+// Travamentos de CCS do mediaanalysisd terminavam em loop de restart e congelamento total.
+// ─── xe/gpurec (22/10): recover the render reset domain sibling (RCS <-> CCS) after a GPU restart ───────────────
+// AppleIntelTGLGraphics 16.0.x, IGHardwareRingBuffer::resetGraphicsEngine (file 0x43576), host scheduler path:
+//   save ring->0x78 list (MMIO) -> GAMTARBMODE 0x4a08 |= bit2 -> GDRST 0x941c = ring->0x70 -> poll -> 0x4a08 &= ~bit2
+//   -> restore ring->0x78 list (value = accel->getDefaultResetValue(reg) ?: saved, masked regs | 0xffff0000)
+//   -> IGScheduler5::processGPUReset(ring->0x40 = IGHwCsType, ctx) for THAT engine only.
+// RCS (type 0, IGHardwareRingBufferMain::init 0x84d10) and CCS (type 1, IGHardwareRingBufferCompute::init 0x4e35a)
+// both use GDRST mask 0x2 (GEN11_GRDOM_RENDER, the shared render reset domain), but each restores only its own list
+// (_rcsResetRegisters / _ccsResetRegisters) and replays only its own engine. A reset of one therefore leaves the other
+// with HWS_PGA=0, GFX_MODE=0, FORCE_TO_NONPRIV at defaults, its in-flight context dropped by the hardware and the
+// scheduler still waiting for its CSB events: every gpuRestart report after the first CCS reset shows exactly that
+// (RCS GFX_MODE 0x8000->0, HWS_PGA 0x40004000->0, NONPRIV 0xe100->0xe000, EXECLIST_STATUS 0x1), its stamps never return,
+// restarts of its channels are "Skipped / no channel associated", WindowServer blocks and watchdogd panics.
+// Fix (what i915 does for engines that share a reset domain): around the original, snapshot the sibling's list; after
+// a real GDRST, restore it (same value rule as Apple, last known-good snapshot if the live one is already broken) and
+// run IGScheduler5::processGPUReset for the sibling (CSB head reset, in-flight stamps retired, execlist resubmitted).
+// Off: -ngreennogpurec. Diagnostics: ioreg -rc IntelAccelerator | grep xe-rec.
+static mach_vm_address_t gOrgRge = 0, gRecSfw = 0, gRecGetDef = 0, gRecS5Proc = 0, gRecList[2] = {0, 0};
+static int gRecOn = 0;
+static uint32_t gRecGood[2][64];
+static bool gRecGoodOk[2] = {false, false};
+static volatile uint32_t gRecResets = 0, gRecSibRestores = 0, gRecSibReplays = 0, gRecOwnFix = 0, gRecSkipKick = 0, gRecLast = 0;
+
+static inline uint32_t xeRecRd(volatile uint8_t *mmio, uint32_t r) { return *reinterpret_cast<volatile uint32_t *>(mmio + r); }
+static inline void xeRecWr(volatile uint8_t *mmio, uint32_t r, uint32_t v) { *reinterpret_cast<volatile uint32_t *>(mmio + r) = v; }
+// IGVector<resetRegisterInfo>: {u64 count; u64 capacity; resetRegisterInfo *data}, entry 0x24 B: u32 reg, u32 val, u8 masked, name@0xa
+static inline bool xeRecList(int i, uint64_t &n, uint8_t *&d) {
+	auto *v = reinterpret_cast<uint8_t *>(gRecList[i]);
+	if (!v) return false;
+	n = *reinterpret_cast<uint64_t *>(v);
+	d = *reinterpret_cast<uint8_t **>(v + 0x10);
+	return d && n > 0 && n <= 64 && *reinterpret_cast<uint32_t *>(d) == (i == 0 ? 0x2080u : 0x1a080u);  // entry 0 = HWS_PGA
+}
+static inline uint32_t xeRecReg(uint8_t *d, uint64_t i) { return *reinterpret_cast<uint32_t *>(d + i * 0x24); }
+static inline bool xeRecMasked(uint8_t *d, uint64_t i) { return d[i * 0x24 + 8] != 0; }
+
+static void xeRecWriteList(void *acc, volatile uint8_t *mmio, uint8_t *d, uint64_t n, const uint32_t *src) {
+	auto getDef = reinterpret_cast<uint32_t (*)(void *, uint32_t)>(gRecGetDef);
+	for (uint64_t i = 0; i < n; i++) {
+		uint32_t reg = xeRecReg(d, i), v = getDef(acc, reg);
+		if (!v) v = src[i];
+		if (xeRecMasked(d, i)) v |= 0xffff0000u;
+		xeRecWr(mmio, reg, v);
+	}
+	(void)xeRecRd(mmio, xeRecReg(d, 0));  // posting read
+}
+
+// ─── xe/gpurec2 (23/10): registers of the render reset domain that are in NEITHER Apple reset list ──────────────
+// IntelAccelerator::initModeRegisters (file 0x28e1a, called only from startGraphicsEngine 0x2513e, i.e. boot/wake) writes
+//   RCU_MODE 0x14800 = masked bit0 <- (accel->0x1190 >> 33) & 1   ("Multi-Context (Compute Command Streamer) Enabled")
+//   0xce90 |= 0x10001 (conditional), CCS FORCE_TO_NONPRIV0 0x1a4d0 = 0xb134
+// GDRST bit1 (GEN11_GRDOM_RENDER) resets them, and neither _rcsResetRegisters (32) nor _ccsResetRegisters (4: HWS_PGA,
+// INSTPM, MI_MODE, GFX_MODE) contains them. After ANY render-domain reset (RCS by Apple, CCS by Apple, or our sibling
+// path) the CCS is left disabled: ELSP writes produce no CSB event, IGHardwareCommandStreamer5 never flips its port, so
+// getActiveContexts() is empty -> IGAccelEventMachine::eventTimeout returns NULL -> IOAF "no channel associated with
+// stamp_idx 24..31" forever; or, when the CCS itself is restarted, the post-reset stamp test times out every time.
+// Fix: snapshot them before the reset, and re-apply them right after GDRST, BEFORE any replay touches ELSP (the own
+// engine's replay runs inside Apple's resetGraphicsEngine, so it is done from an IGScheduler5::processGPUReset wrapper).
+// CCS RING_IMR 0x1a0a8 / RING_HWSTAM 0x1a098 are engine registers also missing from the CCS list (RCS list has
+// CONTROL_IMR 0x20a8); they are restored to their pre-reset values only if the reset changed them.
+static const uint32_t kXeRecEx[5] = {0x14800, 0xce90, 0x1a4d0, 0x1a0a8, 0x1a098};
+static const bool kXeRecExMasked[5] = {true, true, false, false, false};
+static uint32_t gRecExSnap[5], gRecExGood[5];
+static bool gRecExSnapOk = false, gRecExGoodOk = false;
+static mach_vm_address_t gOrgS5Proc = 0;
+static int gRecExOn = 0;
+static void *volatile gRecPendAcc = nullptr;
+static volatile uint8_t *volatile gRecPendMmio = nullptr;
+static volatile uint32_t gRecExFix = 0, gRecExLastRcu = 0xffffffffu;
+
+static inline uint32_t xeRecCcsOn(void *acc) {
+	return (uint32_t)((*reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(acc) + 0x1190) >> 33) & 1);
+}
+static void xeRecExSnapshot(void *acc, volatile uint8_t *mmio) {
+	uint32_t v[5];
+	for (int i = 0; i < 5; i++) v[i] = xeRecRd(mmio, kXeRecEx[i]);
+	// only trust a snapshot taken while the domain was healthy (RCU_MODE matches what startGraphicsEngine programmed)
+	gRecExSnapOk = (v[0] & 1) == xeRecCcsOn(acc);
+	if (gRecExSnapOk) {
+		for (int i = 0; i < 5; i++) gRecExSnap[i] = gRecExGood[i] = v[i];
+		gRecExGoodOk = true;
+	}
+}
+// Idempotent: writes only registers whose live value differs from the healthy one. Returns a bitmask of what it wrote.
+static uint32_t xeRecExFix(void *acc, volatile uint8_t *mmio) {
+	if (gRecExOn != 1 || !acc || !mmio) return 0;
+	uint32_t did = 0, on = xeRecCcsOn(acc), rcu = xeRecRd(mmio, kXeRecEx[0]);
+	gRecExLastRcu = rcu;
+	if ((rcu & 1) != on) { xeRecWr(mmio, kXeRecEx[0], 0x10000u | on); did |= 1; }   // exactly Apple's initModeRegisters write
+	const uint32_t *src = gRecExSnapOk ? gRecExSnap : (gRecExGoodOk ? gRecExGood : nullptr);
+	if (src) for (int i = 1; i < 5; i++) {
+		if (i == 2 && !on) continue;                       // CCS whitelist only matters with CCS enabled
+		uint32_t cur = xeRecRd(mmio, kXeRecEx[i]);
+		if (kXeRecExMasked[i] ? ((cur & 0xffff) == (src[i] & 0xffff)) : (cur == src[i])) continue;
+		xeRecWr(mmio, kXeRecEx[i], kXeRecExMasked[i] ? (0xffff0000u | (src[i] & 0xffff)) : src[i]);
+		did |= 1u << i;
+	}
+	if (did) { (void)xeRecRd(mmio, kXeRecEx[0]); gRecExFix++; }
+	return did;
+}
+// IGScheduler5::processGPUReset is called by resetGraphicsEngine right after GDRST + list restore (file 0x43842) and by
+// our sibling replay. Re-enable the CCS before Apple resubmits to ELSP.
+static void xeRecProc(void *sched, uint32_t type, void *ctx) {
+	auto orig = FunctionCast(xeRecProc, gOrgS5Proc);
+	if (gRecPendAcc && gRecPendMmio) xeRecExFix(gRecPendAcc, gRecPendMmio);
+	orig(sched, type, ctx);
+}
+
+static bool xeRecResetGraphicsEngine(void *ring, void *ctx) {
+	auto orig = FunctionCast(xeRecResetGraphicsEngine, gOrgRge);
+	auto *r = static_cast<uint8_t *>(ring);
+	if (gRecOn != 1 || !r) return orig(ring, ctx);
+	auto *acc = *reinterpret_cast<uint8_t **>(r + 0x10);
+	auto *mmio = *reinterpret_cast<volatile uint8_t **>(r + 0x50);
+	uint32_t mask = *reinterpret_cast<uint32_t *>(r + 0x70);
+	mach_vm_address_t ownList = *reinterpret_cast<mach_vm_address_t *>(r + 0x78);
+	uint8_t type = r[0x40];
+	int own = ownList == gRecList[0] ? 0 : ownList == gRecList[1] ? 1 : -1;
+	if (!acc || !mmio || !(mask & 2) || own < 0 || type != (uint8_t)own) return orig(ring, ctx);
+	int sib = 1 - own;
+	uint64_t sn = 0, on = 0; uint8_t *sd = nullptr, *od = nullptr;
+	if (!xeRecList(sib, sn, sd) || !xeRecList(own, on, od)) return orig(ring, ctx);
+
+	auto sfw = reinterpret_cast<void (*)(void *, bool, uint32_t)>(gRecSfw);
+	sfw(acc, true, 7);  // hold render/media/GT across the whole reset (Apple takes and drops its own inside)
+	uint32_t snap[64], osnap[64];
+	for (uint64_t i = 0; i < sn; i++) snap[i] = xeRecRd(mmio, xeRecReg(sd, i));
+	for (uint64_t i = 0; i < on; i++) osnap[i] = xeRecRd(mmio, xeRecReg(od, i));
+	if (snap[0]) { for (uint64_t i = 0; i < sn; i++) gRecGood[sib][i] = snap[i]; gRecGoodOk[sib] = true; }
+	if (osnap[0]) { for (uint64_t i = 0; i < on; i++) gRecGood[own][i] = osnap[i]; gRecGoodOk[own] = true; }
+	// resetGraphicsEngine's "ring wait" path (engine flags 0x4/0x8 at ring->0x8b8[type]+0xa4) only kicks RING_CTL and may
+	// not reach GDRST; then only act if the sibling visibly lost its state.
+	auto *eng = *reinterpret_cast<uint8_t **>(r + 0x8b8 + (uint64_t)type * 8);
+	bool kick = eng && (*reinterpret_cast<uint32_t *>(eng + 0xa4) & 0xc);
+
+	xeRecExSnapshot(acc, mmio);
+	gRecPendAcc = acc; gRecPendMmio = mmio;     // xeRecProc() re-applies the extras between GDRST and Apple's replay
+	bool ret = orig(ring, ctx);
+	gRecPendAcc = nullptr; gRecPendMmio = nullptr;
+	uint32_t exDid = xeRecExFix(acc, mmio);   // no-op if xeRecProc already did it
+
+	uint32_t sibHws = xeRecRd(mmio, xeRecReg(sd, 0));
+	bool lost = snap[0] ? (sibHws == 0) : true;
+	bool gdrst = !kick || (snap[0] && sibHws == 0);
+	gRecResets++;
+	uint32_t did = 0;
+	if (ret && gdrst && lost) {
+		const uint32_t *src = snap[0] ? snap : (gRecGoodOk[sib] ? gRecGood[sib] : snap);
+		xeRecWriteList(acc, mmio, sd, sn, src);
+		gRecSibRestores++; did |= 1;
+		// own engine: Apple restored from what it saved; if that was already broken (HWS_PGA 0), use the known-good copy
+		if (xeRecRd(mmio, xeRecReg(od, 0)) == 0 && gRecGoodOk[own]) {
+			xeRecWriteList(acc, mmio, od, on, gRecGood[own]);
+			gRecOwnFix++; did |= 2;
+		}
+		// replay the sibling: IGScheduler5::processGPUReset(type, ctx) -> IGHardwareCommandStreamer5::processGPUReset
+		auto *sched = *reinterpret_cast<uint8_t **>(acc + 0x1250);
+		auto *vt = sched ? *reinterpret_cast<mach_vm_address_t **>(sched) : nullptr;
+		auto *cs = sched ? *reinterpret_cast<uint8_t **>(sched + 0xca0 + (uint64_t)sib * 8) : nullptr;
+		auto *desc = cs ? *reinterpret_cast<uint8_t **>(cs + 0x28) : nullptr;
+		if (vt && vt[0x190 / 8] == gRecS5Proc && desc && desc[0] == (uint8_t)sib) {
+			reinterpret_cast<void (*)(void *, uint32_t, void *)>(gRecS5Proc)(sched, (uint32_t)sib, nullptr);
+			gRecSibReplays++; did |= 4;
+		}
+	} else if (kick && !gdrst) {
+		gRecSkipKick++;
+	}
+	if (exDid) did |= 8;
+	sfw(acc, false, 7);
+	gRecLast = (uint32_t)own | ((uint32_t)ret << 4) | ((uint32_t)kick << 5) | (did << 8) | ((snap[0] >> 12) << 12);
+	xeEv('GREC', gRecLast, snap[0], sibHws);
+	if (gRecResets <= 32)
+		IOLog("XeNG GPUREC: reset %s ret=%d kick=%d sibHWS %x->%x restore=%d ownfix=%d replay=%d (n=%u)\n", own ? "CCS" : "RCS",
+		      ret, kick, snap[0], sibHws, !!(did & 1), !!(did & 2), !!(did & 4), gRecResets);
+	auto *svc = reinterpret_cast<IOService *>(acc);
+	svc->setProperty("xe-rec-resets", gRecResets, 32);
+	svc->setProperty("xe-rec-sibrestores", gRecSibRestores, 32);
+	svc->setProperty("xe-rec-sibreplays", gRecSibReplays, 32);
+	svc->setProperty("xe-rec-ownfix", gRecOwnFix, 32);
+	svc->setProperty("xe-rec-last", gRecLast, 32);
+	svc->setProperty("xe-rec-exfix", gRecExFix, 32);
+	svc->setProperty("xe-rec-rcu", gRecExLastRcu, 32);    // RCU_MODE seen right after the last reset (bit0 0 = CCS was off)
+	return ret;
+}
+
+// Route installer (called from processKext). All addresses are runtime; every assumption is checked by bytes first.
+static void xeGpuRecInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	if (checkKernelArgument("-ngreennogpurec")) { SYSLOG("ngreen", "XE-GPUREC: off (-ngreennogpurec)"); return; }
+	mach_vm_address_t rge = patcher.solveSymbol(index, "__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext", address, size);
+	patcher.clearError();
+	gRecSfw = patcher.solveSymbol(index, "__ZN16IntelAccelerator13SafeForceWakeEbj", address, size); patcher.clearError();
+	gRecGetDef = patcher.solveSymbol(index, "__ZN16IntelAccelerator20getDefaultResetValueEj", address, size); patcher.clearError();
+	gRecS5Proc = patcher.solveSymbol(index, "__ZN12IGScheduler515processGPUResetE10IGHwCsTypeP17IGHardwareContext", address, size); patcher.clearError();
+	mach_vm_address_t cs5Proc = patcher.solveSymbol(index, "__ZN26IGHardwareCommandStreamer515processGPUResetEv", address, size); patcher.clearError();
+	gRecList[0] = patcher.solveSymbol(index, "_rcsResetRegisters", address, size); patcher.clearError();
+	gRecList[1] = patcher.solveSymbol(index, "_ccsResetRegisters", address, size); patcher.clearError();
+	auto has = [](mach_vm_address_t f, size_t len, const uint8_t *p, size_t n) {
+		if (!f) return false;
+		auto *b = reinterpret_cast<const uint8_t *>(f);
+		for (size_t i = 0x10; i + n <= len; i++) if (!memcmp(b + i, p, n)) return true;  // skip the entry (route jump)
+		return false;
+	};
+	// movl $0x40004,0x4a08(%rax); movl 0x70(%r12),%ecx; movl %ecx,0x941c(%rax)
+	static const uint8_t sGdrst[] = {0xc7, 0x80, 0x08, 0x4a, 0x00, 0x00, 0x04, 0x00, 0x04, 0x00, 0x41, 0x8b, 0x4c, 0x24, 0x70, 0x89, 0x88, 0x1c, 0x94, 0x00, 0x00};
+	// movzbl 0x40(%r12),%esi; movq (%rdi),%rax; movq -0x30(%rbp),%rdx; callq *0x190(%rax)   (sched->processGPUReset(type, ctx))
+	static const uint8_t sProc[] = {0x41, 0x0f, 0xb6, 0x74, 0x24, 0x40, 0x48, 0x8b, 0x07, 0x48, 0x8b, 0x55, 0xd0, 0xff, 0x90, 0x90, 0x01, 0x00, 0x00};
+	// movzbl 0x40(%r12),%eax; movq 0x8b8(%r12,%rax,8),%rax; movl 0xa4(%rax),%ecx
+	static const uint8_t sFlags[] = {0x41, 0x0f, 0xb6, 0x44, 0x24, 0x40, 0x49, 0x8b, 0x84, 0xc4, 0xb8, 0x08, 0x00, 0x00, 0x8b, 0x88, 0xa4, 0x00, 0x00, 0x00};
+	// IGScheduler5::processGPUReset: movl %esi,%eax; movq 0xca0(%rdi,%rax,8),%rdi
+	static const uint8_t sS5[] = {0x89, 0xf0, 0x48, 0x8b, 0xbc, 0xc7, 0xa0, 0x0c, 0x00, 0x00};
+	// IGHardwareCommandStreamer5::processGPUReset: movl $7,%eax; movl %eax,0x1c04(%rdi)
+	static const uint8_t sCs5[] = {0xb8, 0x07, 0x00, 0x00, 0x00, 0x89, 0x87, 0x04, 0x1c, 0x00, 0x00};
+	bool sig1 = has(rge, 0x320, sGdrst, sizeof(sGdrst)), sig2 = has(rge, 0x320, sProc, sizeof(sProc)),
+	     sig3 = has(rge, 0x320, sFlags, sizeof(sFlags));
+	bool sig4 = false;
+	if (gRecS5Proc) sig4 = !memcmp(reinterpret_cast<const uint8_t *>(gRecS5Proc) + 4, sS5, sizeof(sS5));
+	bool sig5 = has(cs5Proc, 0x40, sCs5, sizeof(sCs5)) || (cs5Proc && !memcmp(reinterpret_cast<const uint8_t *>(cs5Proc) + 0xe, sCs5, sizeof(sCs5)));
+	uint64_t n0 = 0, n1 = 0; uint8_t *d0 = nullptr, *d1 = nullptr;
+	// the lists are filled by the static constructors of the TGL kext, which ran before processKext; check them now
+	bool l0 = xeRecList(0, n0, d0), l1 = xeRecList(1, n1, d1);
+	bool ok = rge && gRecSfw && gRecGetDef && gRecS5Proc && sig1 && sig2 && sig3 && sig4 && sig5;
+	// IntelAccelerator::initModeRegisters @0x28e7e: movl $0xfffefffe,%ecx; andl 0x14800(%rax),%ecx; movq 0x1190(%rdi),%rdx;
+	// shrq $0x21,%rdx; andl $1,%edx; leal 0x10000(%rcx,%rdx),%ecx; movl %ecx,0x14800(%rax)
+	static const uint8_t sRcu[] = {0xb9, 0xfe, 0xff, 0xfe, 0xff, 0x23, 0x88, 0x00, 0x48, 0x01, 0x00, 0x48, 0x8b, 0x97, 0x90, 0x11, 0x00, 0x00,
+	                               0x48, 0xc1, 0xea, 0x21, 0x83, 0xe2, 0x01, 0x8d, 0x8c, 0x11, 0x00, 0x00, 0x01, 0x00, 0x89, 0x88, 0x00, 0x48, 0x01, 0x00};
+	// ... movl $0xb134,0x1a4d0(%rax)
+	static const uint8_t sNp[] = {0xc7, 0x80, 0xd0, 0xa4, 0x01, 0x00, 0x34, 0xb1, 0x00, 0x00};
+	mach_vm_address_t imr = patcher.solveSymbol(index, "__ZN16IntelAccelerator17initModeRegistersEv", address, size); patcher.clearError();
+	bool sig6 = has(imr, 0x120, sRcu, sizeof(sRcu)) && has(imr, 0x120, sNp, sizeof(sNp));
+	if (ok) {
+		RouteRequestPlus rec[] = {
+			{"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext", xeRecResetGraphicsEngine, gOrgRge},
+		};
+		if (RouteRequestPlus::routeAll(patcher, index, rec, address, size)) gRecOn = 1;
+		else patcher.clearError();
+		// second route only if the first one is in and initModeRegisters matches; off with -ngreennogpurecex
+		if (gRecOn == 1 && sig6 && !checkKernelArgument("-ngreennogpurecex")) {
+			RouteRequestPlus rec2[] = {
+				{"__ZN12IGScheduler515processGPUResetE10IGHwCsTypeP17IGHardwareContext", xeRecProc, gOrgS5Proc},
+			};
+			if (RouteRequestPlus::routeAll(patcher, index, rec2, address, size) && gOrgS5Proc) gRecExOn = 1;
+			else patcher.clearError();
+		}
+	}
+	SYSLOG("ngreen", "XE-GPUREC: sym rge=%d sfw=%d def=%d s5=%d cs5=%d lists=%d/%d(n=%llu/%llu) sig=%d%d%d%d%d%d route=%d ex=%d",
+	       rge != 0, gRecSfw != 0, gRecGetDef != 0, gRecS5Proc != 0, cs5Proc != 0, l0, l1, n0, n1, sig1, sig2, sig3, sig4, sig5, sig6, gRecOn, gRecExOn);
+}
