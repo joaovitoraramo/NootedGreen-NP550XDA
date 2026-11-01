@@ -4261,8 +4261,8 @@ static void dpbPrepTraining(uint8_t bw, uint8_t lanes) {
 		if (nf != f) wr(0x61400, nf);
 	}
 	static int n = 0;
-	if (n++ < 20) IOLog("XeNG DPB prep bw=%02x lanes=%u pll=%d DPLL1=%08x %08x %08x CLKA=%08x CLKSEL_B=%08x FUNC_B=%08x -> %08x DDI_PW=%08x/%08x\n",
-						bw, lanes, pll, rd(0x46014), rd(0x16428C), rd(0x164290), rd(0x164280), rd(0x46144), f, rd(0x61400), rd(0x45400), rd(0x45404));
+	if (n++ < 20) IOLog("XeNG DPB prep bw=%02x lanes=%u pll=%d DPLL1=%08x %08x %08x CLKA=%08x CLKSEL_B=%08x FUNC_B=%08x -> %08x DDI_PW=%08x/%08x SDEISR=%08x\n",
+						bw, lanes, pll, rd(0x46014), rd(0x16428C), rd(0x164290), rd(0x164280), rd(0x46144), f, rd(0x61400), rd(0x45400), rd(0x45404), rd(0xC4008));
 }
 IOReturn Gen11::wrapWriteAUX(void *that, uint32_t address, void *buffer, uint32_t length) {
 	if (address == 0x100 && length >= 2 && buffer && gDpBLinked && hdmiEmuOn() && that) {
@@ -4924,8 +4924,10 @@ static uint32_t dpbPhyFix(uint32_t r, uint32_t val) {
 	uint32_t nv = val;
 	// Nível de swing pedido pela Apple (o TX_DW2 dela vem antes do TRAINING_LANE_SET): 0x1098, 0x9870, 0x2800, 0x3098.
 	// Valores do i915 (trace no Linux: nível 0 swing 0xA/N 0x35, nível 1 swing 0xC/N 0x47); 2 e 3 da tabela HBR2 do TGL.
-	static const uint32_t kDw2[4] = {0x9098, 0xA098, 0xA098, 0x3098};
-	static const uint32_t kN[4] = {0x35, 0x47, 0x61, 0x7F};
+	// O nível 0 já sai com os valores do nível 1: no Linux a lane 0 só trava no nível 1, e aqui o hub derruba o HPD antes
+	// da Apple subir o swing (a primeira transação AUX vem ~30 ms depois de ligar a DDI).
+	static const uint32_t kDw2[4] = {0xA098, 0xA098, 0xA098, 0x3098};
+	static const uint32_t kN[4] = {0x47, 0x47, 0x61, 0x7F};
 	static uint32_t lvl = 0;
 	if (tx && d == 2) {
 		switch (val & 0xFFFF) {
