@@ -6562,6 +6562,17 @@ uint8_t Gen11::hwRegsNeedUpdate
 			if (n++ < 10) IOLog("XeNG DPB hwRegsNeedUpdate: FB externo com transcoder desligado -> modeset completo (original %u)\n", need);
 			return 1;
 		}
+		// Path da DDI B (USB-C) com o link treinado: a decisão fica com a Apple. Com 0 fixo, a troca de modo (720x480 ->
+		// 1080p, 01/11) virava "partial modeset by updating plane": timing novo com stride/plano velhos (imagem 3x, listras).
+		if (gDpBLinked && param_2) {
+			void *port = getMember<void *>(param_2, 0x3648);
+			auto *c = port ? getMember<uint32_t *>(port, 0x548) : nullptr;
+			if (c && c[0] == 1) {
+				static int n = 0;
+				if (n++ < 10) IOLog("XeNG DPB hwRegsNeedUpdate: path da DDI B -> decisão da Apple = %u\n", need);
+				return need;
+			}
+		}
 		return 0;
 	}
 	return need;
