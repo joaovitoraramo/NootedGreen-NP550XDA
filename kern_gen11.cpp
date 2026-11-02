@@ -13291,6 +13291,33 @@ static uint32_t xeRecExFix(void *acc, volatile uint8_t *mmio) {
 void xeSubDump(uint64_t acthd, uint64_t bb);  // kern_green.cpp
 static uint32_t gRecStorm = 0;
 static uint64_t gRecAbs3s = 0;
+// xe/bbtrace (02/11): os lotes travados (BB_START 0x4017ffc0, ACTHD 0x4019d004…) não vêm do IOAccelCommandBufferPool2
+// (xe/subtrace não os achou); vêm de IGHardwareRingBuffer::submitBatchBuffer (quem escreve o MI_BATCH_BUFFER_START no
+// anel). Guarda as últimas 64 submissões por anel: endereço, tamanho, carimbo, processo que submeteu e quem chamou.
+struct XeBb { uint64_t addr; uint32_t len, stamp; int pid; uint8_t type; uint64_t t; void *caller; };
+static XeBb gXeBbs[64];
+static volatile uint32_t gXeBbN = 0;
+static mach_vm_address_t gOrgSubmitBb = 0;
+static uint64_t xeRecSubmitBatchBuffer(void *ring, uint64_t addr, uint32_t len, uint32_t *stamp, uint32_t flags, bool b1, bool b2) {
+	auto *r = static_cast<uint8_t *>(ring);
+	auto &e = gXeBbs[gXeBbN++ % 64];
+	e.addr = addr; e.len = len; e.stamp = stamp ? *stamp : 0; e.pid = proc_selfpid(); e.type = r ? r[0x40] : 0xff;
+	e.t = mach_absolute_time(); e.caller = __builtin_return_address(0);
+	return FunctionCast(xeRecSubmitBatchBuffer, gOrgSubmitBb)(ring, addr, len, stamp, flags, b1, b2);
+}
+static void xeBbDump(uint32_t acthd, uint32_t bb) {
+	uint32_t n = gXeBbN;
+	IOLog("XeNG BBTRACE: ACTHD %08x BB %08x, %u submissoes ao anel\n", acthd, bb, n);
+	for (uint32_t k = (n > 14 ? n - 14 : 0); k < n; k++) {
+		auto &e = gXeBbs[k % 64];
+		char nome[32] = "?";
+		proc_name(e.pid, nome, sizeof(nome));
+		bool dentro = acthd >= e.addr && acthd < e.addr + e.len;
+		bool eh = bb >= e.addr && bb < e.addr + e.len;
+		IOLog("XeNG BBTRACE:  #%u anel %u gpu %llx+%x carimbo %u pid %d %s chamador %p%s%s\n", k, e.type, e.addr, e.len, e.stamp, e.pid, nome,
+		      e.caller, dentro ? " <- ACTHD dentro" : "", eh ? " <- BB" : "");
+	}
+}
 static mach_vm_address_t gOrgSleepStamp = 0;
 static bool xeRecSleepForStamp(void *ring, uint32_t *out, uint32_t want, uint32_t us) {
 	bool to = FunctionCast(xeRecSleepForStamp, gOrgSleepStamp)(ring, out, want, us);
@@ -13357,6 +13384,7 @@ static bool xeRecResetGraphicsEngine(void *ring, void *ctx) {
 			      gRecResets + 1, gRecStorm, acthd, bb, ipehr, xeRecRd(mmio, 0x20b0), xeRecRd(mmio, 0x20b8), xeRecRd(mmio, 0x2034),
 			      xeRecRd(mmio, 0x2030), xeRecRd(mmio, 0x2234), xeRecRd(mmio, 0x2238));
 			xeSubDump(acthd, bb);
+			xeBbDump(acthd, bb);
 		}
 	}
 	xeRecExSnapshot(acc, mmio);
@@ -13560,9 +13588,10 @@ static void xeGpuRecInstall(KernelPatcher &patcher, size_t index, mach_vm_addres
 	}
 	if (gRecOn == 1) xeStfInstall(patcher, index, address, size);  // xe/stampfix (01/11)
 	if (gRecOn == 1) {  // xe/hangdiag (02/11): contagem dos timeouts de 1 s do laço de resetHardwareAndReplay
-		RouteRequestPlus sw[] = {{"__ZN20IGHardwareRingBuffer13sleepForStampEPjjj", xeRecSleepForStamp, gOrgSleepStamp}};
+		RouteRequestPlus sw[] = {{"__ZN20IGHardwareRingBuffer13sleepForStampEPjjj", xeRecSleepForStamp, gOrgSleepStamp},
+		                         {"__ZN20IGHardwareRingBuffer17submitBatchBufferEyjPjjbb", xeRecSubmitBatchBuffer, gOrgSubmitBb}};
 		if (!RouteRequestPlus::routeAll(patcher, index, sw, address, size)) patcher.clearError();
-		SYSLOG("ngreen", "XE-HANGDIAG: sleepForStamp route=%d", gOrgSleepStamp != 0);
+		SYSLOG("ngreen", "XE-HANGDIAG: sleepForStamp route=%d submitBatchBuffer route=%d", gOrgSleepStamp != 0, gOrgSubmitBb != 0);
 	}
 	SYSLOG("ngreen", "XE-GPUREC: sym rge=%d sfw=%d def=%d s5=%d cs5=%d lists=%d/%d(n=%llu/%llu) sig=%d%d%d%d%d%d route=%d ex=%d",
 	       rge != 0, gRecSfw != 0, gRecGetDef != 0, gRecS5Proc != 0, cs5Proc != 0, l0, l1, n0, n1, sig1, sig2, sig3, sig4, sig5, sig6, gRecOn, gRecExOn);
