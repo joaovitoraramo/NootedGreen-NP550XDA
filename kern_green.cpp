@@ -417,12 +417,16 @@ void xeSubDump(uint64_t acthd, uint64_t bb) {
 }
 
 // Para o xe/bbtrace (kern_gen11.cpp): tamanho do buffer de pool que contém o ponteiro de CPU dado (0 se não é de pool).
-uint32_t xePoolSizeOf(uint64_t cpu, int *idx) {
+uint32_t xePoolSizeOf(uint64_t cpu, int *idx, uint64_t *outBase) {
 	for (uint32_t j = 0; j < gXePoolN; j++) {
 		auto *p = static_cast<uint8_t *>(gXePools[j].pool);
 		for (int i = 0; p && i < gXePools[j].count && i < 256; i++) {
 			uint64_t base = *reinterpret_cast<uint64_t *>(p + 0x40 + 24 * (uint64_t)i);
-			if (base && cpu >= base && cpu < base + (uint64_t)gXePools[j].size) { if (idx) *idx = i; return (uint32_t)gXePools[j].size; }
+			if (base && cpu >= base && cpu < base + (uint64_t)gXePools[j].size) {
+				if (idx) *idx = i;
+				if (outBase) *outBase = base;
+				return (uint32_t)gXePools[j].size;
+			}
 		}
 	}
 	return 0;

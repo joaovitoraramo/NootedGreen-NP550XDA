@@ -13343,46 +13343,50 @@ static uint64_t xeRecSubmitBatchBuffer(void *ring, uint64_t addr, uint32_t seq, 
 	}
 	return FunctionCast(xeRecSubmitBatchBuffer, gOrgSubmitBb)(ring, addr, seq, hdr, flags, b1, b2);
 }
-uint32_t xePoolSizeOf(uint64_t cpu, int *idx);  // kern_green.cpp
+uint32_t xePoolSizeOf(uint64_t cpu, int *idx, uint64_t *base);  // kern_green.cpp
 static void xeBbDw(const char *rot, uint64_t cpu, uint64_t gpu, int n) {
 	auto *d = reinterpret_cast<const volatile uint32_t *>(cpu);
 	IOLog("XeNG BBTRACE:  %s gpu %llx: %08x %08x %08x %08x %08x %08x %08x %08x\n", rot, gpu, d[0], d[1], d[2], d[3], n > 4 ? d[4] : 0,
 	      n > 5 ? d[5] : 0, n > 6 ? d[6] : 0, n > 7 ? d[7] : 0);
 }
+// BB_ADDR é a posição ATUAL do lote (≈ ACTHD), não o início. O início só está no anel; então lista os descritores com
+// endereço até 256 KB abaixo do ACTHD (os candidatos a lote travado), com o buffer do pool de cada um e se o lote
+// passa do fim do buffer, e lê pela CPU o início, a página seguinte e o fim do lote.
 static void xeBbDump(void *ring, uint32_t acthd, uint32_t bb) {
 	bb &= ~3u;
 	uint32_t n = gXeBbN, shown = 0;
 	IOLog("XeNG BBTRACE: anel %llx ACTHD %08x BB %08x, %u submissoes ao anel, flushes=%u\n", (uint64_t)ring, acthd, bb, n, gXeFlushN);
 	for (uint32_t k = (n > 128 ? n - 128 : 0); k < n; k++) {
 		auto &e = gXeBbs[k % 128];
-		bool ult = k + 4 >= n;
-		if (e.ring != ring && !ult) continue;
-		if (e.ring == ring && ++shown + 16 < 128 && n - k > 16 && !ult) continue;  // só as 16 últimas do anel travado
+		bool ult = k + 3 >= n, perto = e.addr <= acthd && acthd - e.addr < 0x40000;
+		if (e.ring != ring && !ult && !perto) continue;
+		if (e.ring == ring && ++shown > 12 && !ult && !perto) continue;
 		char nome[32] = "?";
 		proc_name(e.pid, nome, sizeof(nome));
-		IOLog("XeNG BBTRACE:  #%u anel %llx t%u s%d gpu %llx seq %u hdr %08x pid %d %s fl=%u chamador %llx%s%s\n", k, (uint64_t)e.ring, e.type, e.sidx,
-		      e.addr, e.seq, e.hdr, e.pid, nome, e.flushed, (uint64_t)e.caller, (bb >= e.addr && bb < e.addr + 0x2000) ? " <- BB" : "",
-		      e.ring == ring ? "" : " (outro anel)");
+		IOLog("XeNG BBTRACE:  #%u anel %llx t%u s%d gpu %llx seq %u hdr %08x pid %d %s fl=%u%s%s\n", k, (uint64_t)e.ring, e.type, e.sidx, e.addr,
+		      e.seq, e.hdr, e.pid, nome, e.flushed, perto ? " <- abaixo do ACTHD" : "", e.ring == ring ? " (anel travado)" : "");
 	}
 	n = gXeCdN;
-	for (uint32_t k = (n > 128 ? n - 128 : 0); k < n; k++) {
+	int cand = 0;
+	for (uint32_t k = n; k-- > (n > 128 ? n - 128 : 0);) {
 		auto &e = gXeCds[k % 128];
 		uint64_t end = e.gpu + e.ndw * 4ULL;
-		bool temBb = bb >= e.gpu && bb < end + 0x40, temAct = acthd >= e.gpu && acthd < end + 0x40;
-		if (!temBb && !temAct && k + 3 < n) continue;
+		bool perto = e.gpu <= acthd && acthd - e.gpu < 0x40000;
+		if (!perto && k + 3 < n) continue;
+		if (perto && ++cand > 6) continue;
 		char nome[32] = "?";
 		proc_name(e.pid, nome, sizeof(nome));
-		int pidx = -1; uint32_t psz = xePoolSizeOf(e.cpu, &pidx);
-		IOLog("XeNG BBTRACE:  desc #%u canal %llx gpu %llx+%x cpu %llx pid %d %s pool buf %d/%u KB%s%s\n", k, (uint64_t)e.ch, e.gpu, e.ndw * 4, e.cpu,
-		      e.pid, nome, pidx, psz >> 10, temBb ? " <- BB" : "", temAct ? " <- ACTHD" : "");
-		if (e.cpu >= 0xffffff8000000000ULL && (temBb || temAct)) {
-			uint64_t base = e.cpu - e.gpu;  // cpu = gpu + base, válido dentro do buffer do pool
-			xeBbDw("BB      ", base + bb, bb, 8);
-			xeBbDw("BB+32   ", base + bb + 32, bb + 32, 8);
-			uint64_t pg = (bb + 0x1000) & ~0xfffULL;
-			if (pg < end + 0x40) { xeBbDw("pagina  ", base + pg, pg, 8); xeBbDw("pag+32  ", base + pg + 32, pg + 32, 8); }
-			if (acthd >= e.gpu + 16 && acthd < end + 0x40) xeBbDw("acthd-16", base + acthd - 16, acthd - 16, 8);
-			xeBbDw("fim-16  ", base + end - 16, end - 16, 8);  // últimos 4 dwords do lote + 4 depois (BB_END da Apple?)
+		int pidx = -1; uint64_t pbase = 0; uint32_t psz = xePoolSizeOf(e.cpu, &pidx, &pbase);
+		uint64_t bufGpu = psz ? e.gpu - (e.cpu - pbase) : 0, bufEnd = bufGpu + psz;
+		IOLog("XeNG BBTRACE:  desc #%u canal %llx gpu %llx+%x cpu %llx pid %d %s pool buf %d/%u KB gpu %llx..%llx%s%s\n", k, (uint64_t)e.ch, e.gpu,
+		      e.ndw * 4, e.cpu, e.pid, nome, pidx, psz >> 10, bufGpu, bufEnd, (psz && end + 8 > bufEnd) ? " ESTOURA O BUFFER" : "",
+		      (acthd >= e.gpu && acthd < end + 0x40) ? " <- ACTHD dentro" : "");
+		if (e.cpu >= 0xffffff8000000000ULL && perto && psz) {
+			uint64_t base = e.cpu - e.gpu;  // cpu = gpu + base, válido dentro do buffer do pool (e um pouco além, mesma alocação?)
+			xeBbDw("inicio  ", base + e.gpu, e.gpu, 8);
+			uint64_t pg = (e.gpu + 0x1000) & ~0xfffULL;
+			if (pg < end + 0x40) { xeBbDw("pag-16  ", base + pg - 16, pg - 16, 8); xeBbDw("pagina  ", base + pg, pg, 8); }
+			if (end + 0x40 <= bufEnd + 0x1000) xeBbDw("fim-16  ", base + end - 16, end - 16, 8);  // 4 últimos dwords + 4 depois (BB_END?)
 		}
 	}
 }
