@@ -389,7 +389,7 @@ void xeSubDump(uint64_t acthd, uint64_t bb) {
 	IOLog("XeNG SUBTRACE: ACTHD %llx BB %llx, %u submissoes, %u pools\n", acthd, bb, n, gXePoolN);
 	for (uint32_t k = (n > 8 ? n - 8 : 0); k < n; k++) {
 		auto &s = gXeSubs[k % 64];
-		IOLog("XeNG SUBTRACE:  #%u pool %p idx %d gpu %llx+%x cpu %llx%s\n", k, s.pool, s.idx, s.gpu, s.ndw * 4, s.cpu,
+		IOLog("XeNG SUBTRACE:  #%u pool %llx idx %d gpu %llx+%x cpu %llx%s\n", k, (uint64_t)s.pool, s.idx, s.gpu, s.ndw * 4, s.cpu,
 		      (acthd >= s.gpu && acthd < s.gpu + (uint64_t)s.ndw * 4 + 8) ? " <- ACTHD dentro" : "");
 	}
 	// o lote mais recente cujo buffer (128 KB no máximo) contém o ACTHD: lê pela CPU o início, o fim e a posição do ACTHD

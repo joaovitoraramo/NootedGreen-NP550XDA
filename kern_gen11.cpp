@@ -13294,28 +13294,61 @@ static uint64_t gRecAbs3s = 0;
 // xe/bbtrace (02/11): os lotes travados (BB_START 0x4017ffc0, ACTHD 0x4019d004…) não vêm do IOAccelCommandBufferPool2
 // (xe/subtrace não os achou); vêm de IGHardwareRingBuffer::submitBatchBuffer (quem escreve o MI_BATCH_BUFFER_START no
 // anel). Guarda as últimas 64 submissões por anel: endereço, tamanho, carimbo, processo que submeteu e quem chamou.
-struct XeBb { uint64_t addr; uint32_t len, stamp; int pid; uint8_t type; uint64_t t; void *caller; };
-static XeBb gXeBbs[64];
+// submitBatchBuffer(ring, addr, seq, &header, flags, b, b): escreve no anel MI_BATCH_BUFFER_START(header|addr) + NOOP; não
+// recebe tamanho. Primeira rodada (11:03): os 14 últimos eram todos do SecurityAgent (0x46e84000…), nenhum em 0x4017ffc0,
+// logo o anel travado é OUTRO IGHardwareRingBuffer (um por contexto): agora guarda o ponteiro do anel e filtra por ele.
+struct XeBb { void *ring; uint64_t addr; uint32_t seq, hdr; int pid; uint8_t type; int8_t sidx; uint64_t t; void *caller; };
+static XeBb gXeBbs[128];
 static volatile uint32_t gXeBbN = 0;
 static mach_vm_address_t gOrgSubmitBb = 0;
-static uint64_t xeRecSubmitBatchBuffer(void *ring, uint64_t addr, uint32_t len, uint32_t *stamp, uint32_t flags, bool b1, bool b2) {
+static uint64_t xeRecSubmitBatchBuffer(void *ring, uint64_t addr, uint32_t seq, uint32_t *hdr, uint32_t flags, bool b1, bool b2) {
 	auto *r = static_cast<uint8_t *>(ring);
-	auto &e = gXeBbs[gXeBbN++ % 64];
-	e.addr = addr; e.len = len; e.stamp = stamp ? *stamp : 0; e.pid = proc_selfpid(); e.type = r ? r[0x40] : 0xff;
-	e.t = mach_absolute_time(); e.caller = __builtin_return_address(0);
-	return FunctionCast(xeRecSubmitBatchBuffer, gOrgSubmitBb)(ring, addr, len, stamp, flags, b1, b2);
+	auto &e = gXeBbs[gXeBbN++ % 128];
+	e.ring = ring; e.addr = addr; e.seq = seq; e.hdr = hdr ? *hdr : 0; e.pid = proc_selfpid(); e.type = r ? r[0x40] : 0xff;
+	e.sidx = r ? (int8_t)*reinterpret_cast<int *>(r + 0x38) : -1; e.t = mach_absolute_time(); e.caller = __builtin_return_address(0);
+	return FunctionCast(xeRecSubmitBatchBuffer, gOrgSubmitBb)(ring, addr, seq, hdr, flags, b1, b2);
 }
-static void xeBbDump(uint32_t acthd, uint32_t bb) {
-	uint32_t n = gXeBbN;
-	IOLog("XeNG BBTRACE: ACTHD %08x BB %08x, %u submissoes ao anel\n", acthd, bb, n);
-	for (uint32_t k = (n > 14 ? n - 14 : 0); k < n; k++) {
-		auto &e = gXeBbs[k % 64];
+// IGAccelFIFOChannel::submitBuffer(IOAccelCommandDescriptor*): por onde passam os lotes do pool (desc+0x18 gpu, +0x20 cpu,
+// +0x30 dwords) e os dos processos; guarda para achar o ponteiro de CPU do lote travado e ler o que a CPU escreveu.
+struct XeCd { void *ch; uint64_t gpu, cpu; uint32_t ndw; int pid; uint64_t t; };
+static XeCd gXeCds[128];
+static volatile uint32_t gXeCdN = 0;
+static mach_vm_address_t gOrgChSubmit = 0;
+static uint64_t xeRecChSubmitBuffer(void *ch, uint8_t *desc) {
+	if (desc) {
+		auto &e = gXeCds[gXeCdN++ % 128];
+		e.ch = ch; e.gpu = *reinterpret_cast<uint64_t *>(desc + 0x18); e.cpu = *reinterpret_cast<uint64_t *>(desc + 0x20);
+		e.ndw = *reinterpret_cast<uint32_t *>(desc + 0x30); e.pid = proc_selfpid(); e.t = mach_absolute_time();
+	}
+	return FunctionCast(xeRecChSubmitBuffer, gOrgChSubmit)(ch, desc);
+}
+static void xeBbDump(void *ring, uint32_t acthd, uint32_t bb) {
+	uint32_t n = gXeBbN, shown = 0;
+	IOLog("XeNG BBTRACE: anel %llx ACTHD %08x BB %08x, %u submissoes ao anel\n", (uint64_t)ring, acthd, bb, n);
+	for (uint32_t k = (n > 128 ? n - 128 : 0); k < n; k++) {
+		auto &e = gXeBbs[k % 128];
+		bool ult = k + 4 >= n;
+		if (e.ring != ring && !ult) continue;
+		if (e.ring == ring && ++shown + 16 < 128 && n - k > 16 && !ult) continue;  // só as 16 últimas do anel travado
 		char nome[32] = "?";
 		proc_name(e.pid, nome, sizeof(nome));
-		bool dentro = acthd >= e.addr && acthd < e.addr + e.len;
-		bool eh = bb >= e.addr && bb < e.addr + e.len;
-		IOLog("XeNG BBTRACE:  #%u anel %u gpu %llx+%x carimbo %u pid %d %s chamador %p%s%s\n", k, e.type, e.addr, e.len, e.stamp, e.pid, nome,
-		      e.caller, dentro ? " <- ACTHD dentro" : "", eh ? " <- BB" : "");
+		IOLog("XeNG BBTRACE:  #%u anel %llx t%u s%d gpu %llx seq %u hdr %08x pid %d %s chamador %llx%s%s\n", k, (uint64_t)e.ring, e.type, e.sidx,
+		      e.addr, e.seq, e.hdr, e.pid, nome, (uint64_t)e.caller, (bb >= e.addr && bb < e.addr + 0x2000) ? " <- BB" : "",
+		      e.ring == ring ? "" : " (outro anel)");
+	}
+	n = gXeCdN;
+	for (uint32_t k = (n > 128 ? n - 128 : 0); k < n; k++) {
+		auto &e = gXeCds[k % 128];
+		if (!(bb >= e.gpu && bb < e.gpu + e.ndw * 4ULL + 0x40) && !(acthd >= e.gpu && acthd < e.gpu + e.ndw * 4ULL + 0x40) && k + 3 < n) continue;
+		char nome[32] = "?";
+		proc_name(e.pid, nome, sizeof(nome));
+		IOLog("XeNG BBTRACE:  desc #%u canal %llx gpu %llx+%x cpu %llx pid %d %s\n", k, (uint64_t)e.ch, e.gpu, e.ndw * 4, e.cpu, e.pid, nome);
+		if (e.cpu >= 0xffffff8000000000ULL && bb >= e.gpu && bb < e.gpu + e.ndw * 4ULL + 0x40) {
+			auto *d = reinterpret_cast<const volatile uint32_t *>(e.cpu + (bb - e.gpu));
+			IOLog("XeNG BBTRACE:  cpu no BB: %08x %08x %08x %08x %08x %08x %08x %08x | fim-8: ", d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+			auto *f = reinterpret_cast<const volatile uint32_t *>(e.cpu + e.ndw * 4ULL - 32);
+			IOLog("%08x %08x %08x %08x %08x %08x %08x %08x\n", f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+		}
 	}
 }
 static mach_vm_address_t gOrgSleepStamp = 0;
@@ -13384,7 +13417,7 @@ static bool xeRecResetGraphicsEngine(void *ring, void *ctx) {
 			      gRecResets + 1, gRecStorm, acthd, bb, ipehr, xeRecRd(mmio, 0x20b0), xeRecRd(mmio, 0x20b8), xeRecRd(mmio, 0x2034),
 			      xeRecRd(mmio, 0x2030), xeRecRd(mmio, 0x2234), xeRecRd(mmio, 0x2238));
 			xeSubDump(acthd, bb);
-			xeBbDump(acthd, bb);
+			xeBbDump(ring, acthd, bb);
 		}
 	}
 	xeRecExSnapshot(acc, mmio);
@@ -13589,9 +13622,10 @@ static void xeGpuRecInstall(KernelPatcher &patcher, size_t index, mach_vm_addres
 	if (gRecOn == 1) xeStfInstall(patcher, index, address, size);  // xe/stampfix (01/11)
 	if (gRecOn == 1) {  // xe/hangdiag (02/11): contagem dos timeouts de 1 s do laço de resetHardwareAndReplay
 		RouteRequestPlus sw[] = {{"__ZN20IGHardwareRingBuffer13sleepForStampEPjjj", xeRecSleepForStamp, gOrgSleepStamp},
-		                         {"__ZN20IGHardwareRingBuffer17submitBatchBufferEyjPjjbb", xeRecSubmitBatchBuffer, gOrgSubmitBb}};
+		                         {"__ZN20IGHardwareRingBuffer17submitBatchBufferEyjPjjbb", xeRecSubmitBatchBuffer, gOrgSubmitBb},
+		                         {"__ZN18IGAccelFIFOChannel12submitBufferEP24IOAccelCommandDescriptor", xeRecChSubmitBuffer, gOrgChSubmit}};
 		if (!RouteRequestPlus::routeAll(patcher, index, sw, address, size)) patcher.clearError();
-		SYSLOG("ngreen", "XE-HANGDIAG: sleepForStamp route=%d submitBatchBuffer route=%d", gOrgSleepStamp != 0, gOrgSubmitBb != 0);
+		SYSLOG("ngreen", "XE-HANGDIAG: sleepForStamp route=%d submitBatchBuffer route=%d chSubmit route=%d", gOrgSleepStamp != 0, gOrgSubmitBb != 0, gOrgChSubmit != 0);
 	}
 	SYSLOG("ngreen", "XE-GPUREC: sym rge=%d sfw=%d def=%d s5=%d cs5=%d lists=%d/%d(n=%llu/%llu) sig=%d%d%d%d%d%d route=%d ex=%d",
 	       rge != 0, gRecSfw != 0, gRecGetDef != 0, gRecS5Proc != 0, cs5Proc != 0, l0, l1, n0, n1, sig1, sig2, sig3, sig4, sig5, sig6, gRecOn, gRecExOn);
