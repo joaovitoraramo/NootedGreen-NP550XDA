@@ -486,6 +486,26 @@ static void *wrapPoolGetPtr(void *that, uint32_t ndw) {
 			!checkKernelArgument("-ngreennopoolfix")) ? 1 : 0;
 		if (hpTglTahoe) IOLog("HP-R6: real TGL/Tahoe upstream pool sizing/alignment enabled=%d\n", fixArg);
 	}
+	// xe/poolguard (02/11, NP550): resolve_ccs pede 2 dwords ao pool e depois escreve o lote inteiro (0x224 B na tela de
+	// login) e chama setBufferPtr. Com o lote começando a 0x40 B do fim de um buffer de 16 KB (0x4017ffc0, fim 0x40180000)
+	// a CPU escreveu 484 B fora do buffer (memória do kernel vizinha) e a GPU, passado o fim, leu zeros e depois veneno
+	// 0xc01dbead -> hang do RCS a cada ~12 min na tela de login, às vezes seguido do laço sem fim de resetHardwareAndReplay.
+	// Guarda: no início de um lote (nada pendente), um pedido pequeno só é atendido se sobrarem 4 KB; senão o pool troca de
+	// buffer (sem meio-lote, porque não há nada pendente). -ngreennopoolguard desliga.
+	if (fixArg == 1 && ndw <= 0x40) {
+		static int guard = -1, nlogG = 0;
+		if (guard < 0) guard = checkKernelArgument("-ngreennopoolguard") ? 0 : 1;
+		auto *p = static_cast<uint8_t *>(that);
+		uint64_t cur = *reinterpret_cast<uint64_t *>(p + 0x1858), start = *reinterpret_cast<uint64_t *>(p + 0x1848);
+		uint64_t lim = *reinterpret_cast<uint64_t *>(p + 0x1850);
+		if (guard == 1 && cur == start && cur + 0x1000 > lim) {
+			if (nlogG < 8) {
+				nlogG++;
+				IOLog("XeNG POOLGUARD[%d] ndw=%u restam %llu B no buffer -> troca de buffer\n", nlogG, ndw, lim > cur ? lim - cur : 0);
+			}
+			return FunctionCast(wrapPoolGetPtr, orgPoolGetPtr)(that, 0x400);
+		}
+	}
 	if (fixArg == 1 && ndw >= 0x400) {
 		auto *p = static_cast<uint8_t *>(that);
 		int16_t idx = *reinterpret_cast<int16_t *>(p + 0x1842);
