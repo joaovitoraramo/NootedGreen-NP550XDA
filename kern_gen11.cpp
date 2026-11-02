@@ -13299,6 +13299,7 @@ static uint64_t gRecAbs3s = 0;
 // logo o anel travado é OUTRO IGHardwareRingBuffer (um por contexto): agora guarda o ponteiro do anel e filtra por ele.
 // IGAccelFIFOChannel::submitBuffer(IOAccelCommandDescriptor*): por onde passam os lotes do pool (desc+0x18 gpu, +0x20 cpu,
 // +0x30 dwords) e os dos processos; guarda para achar o ponteiro de CPU do lote travado e ler o que a CPU escreveu.
+uint32_t xePoolSizeOf(uint64_t cpu, int *idx, uint64_t *base);  // kern_green.cpp
 struct XeCd { void *ch; uint64_t gpu, cpu; uint32_t ndw; int pid; uint64_t t; };
 static XeCd gXeCds[128];
 static volatile uint32_t gXeCdN = 0;
@@ -13308,6 +13309,17 @@ static uint64_t xeRecChSubmitBuffer(void *ch, uint8_t *desc) {
 		auto &e = gXeCds[gXeCdN++ % 128];
 		e.ch = ch; e.gpu = *reinterpret_cast<uint64_t *>(desc + 0x18); e.cpu = *reinterpret_cast<uint64_t *>(desc + 0x20);
 		e.ndw = *reinterpret_cast<uint32_t *>(desc + 0x30); e.pid = proc_selfpid(); e.t = mach_absolute_time();
+		// xe/overflowlog (02/11): o lote passa do fim do buffer do pool? (estouro = corrupção de memória do kernel + GPU lendo lixo)
+		int pidx = -1; uint64_t pbase = 0; uint32_t psz = xePoolSizeOf(e.cpu, &pidx, &pbase);
+		if (psz && e.cpu + e.ndw * 4ULL + 8 > pbase + psz) {
+			static uint32_t nov = 0;
+			nov++;
+			char nome[32] = "?";
+			proc_name(e.pid, nome, sizeof(nome));
+			if (nov <= 16 || !(nov & 255))
+				IOLog("XeNG OVERFLOW[%u]: lote gpu %llx+%x passa %llu B do fim do buffer %d/%u KB (pid %d %s)\n", nov, e.gpu, e.ndw * 4,
+				      e.cpu + e.ndw * 4ULL + 8 - (pbase + psz), pidx, psz >> 10, e.pid, nome);
+		}
 	}
 	return FunctionCast(xeRecChSubmitBuffer, gOrgChSubmit)(ch, desc);
 }
@@ -13327,7 +13339,9 @@ static uint64_t xeRecSubmitBatchBuffer(void *ring, uint64_t addr, uint32_t seq, 
 	e.ring = ring; e.addr = addr; e.seq = seq; e.hdr = hdr ? *hdr : 0; e.pid = proc_selfpid(); e.type = r ? r[0x40] : 0xff;
 	e.sidx = r ? (int8_t)*reinterpret_cast<int *>(r + 0x38) : -1; e.t = mach_absolute_time(); e.caller = __builtin_return_address(0);
 	e.flushed = 0;
-	if (gXeFlushOn < 0) gXeFlushOn = checkKernelArgument("-ngreennocmdflush") ? 0 : 1;
+	// 02/11 12:39: com o flush ligado a máquina morreu de vez (log e ps param no mesmo segundo, sem hang de GPU, sem relatório):
+	// suspeita de clflush em ponteiro de CPU já solto -> page fault no kernel. Agora só liga com -ngreencmdflush.
+	if (gXeFlushOn < 0) gXeFlushOn = checkKernelArgument("-ngreencmdflush") ? 1 : 0;
 	if (gXeFlushOn == 1) {
 		uint32_t n = gXeCdN;
 		for (uint32_t k = n; k-- > (n > 8 ? n - 8 : 0);) {
@@ -13343,7 +13357,6 @@ static uint64_t xeRecSubmitBatchBuffer(void *ring, uint64_t addr, uint32_t seq, 
 	}
 	return FunctionCast(xeRecSubmitBatchBuffer, gOrgSubmitBb)(ring, addr, seq, hdr, flags, b1, b2);
 }
-uint32_t xePoolSizeOf(uint64_t cpu, int *idx, uint64_t *base);  // kern_green.cpp
 static void xeBbDw(const char *rot, uint64_t cpu, uint64_t gpu, int n) {
 	auto *d = reinterpret_cast<const volatile uint32_t *>(cpu);
 	IOLog("XeNG BBTRACE:  %s gpu %llx: %08x %08x %08x %08x %08x %08x %08x %08x\n", rot, gpu, d[0], d[1], d[2], d[3], n > 4 ? d[4] : 0,
