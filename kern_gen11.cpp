@@ -13297,17 +13297,6 @@ static uint64_t gRecAbs3s = 0;
 // submitBatchBuffer(ring, addr, seq, &header, flags, b, b): escreve no anel MI_BATCH_BUFFER_START(header|addr) + NOOP; não
 // recebe tamanho. Primeira rodada (11:03): os 14 últimos eram todos do SecurityAgent (0x46e84000…), nenhum em 0x4017ffc0,
 // logo o anel travado é OUTRO IGHardwareRingBuffer (um por contexto): agora guarda o ponteiro do anel e filtra por ele.
-struct XeBb { void *ring; uint64_t addr; uint32_t seq, hdr; int pid; uint8_t type; int8_t sidx; uint64_t t; void *caller; };
-static XeBb gXeBbs[128];
-static volatile uint32_t gXeBbN = 0;
-static mach_vm_address_t gOrgSubmitBb = 0;
-static uint64_t xeRecSubmitBatchBuffer(void *ring, uint64_t addr, uint32_t seq, uint32_t *hdr, uint32_t flags, bool b1, bool b2) {
-	auto *r = static_cast<uint8_t *>(ring);
-	auto &e = gXeBbs[gXeBbN++ % 128];
-	e.ring = ring; e.addr = addr; e.seq = seq; e.hdr = hdr ? *hdr : 0; e.pid = proc_selfpid(); e.type = r ? r[0x40] : 0xff;
-	e.sidx = r ? (int8_t)*reinterpret_cast<int *>(r + 0x38) : -1; e.t = mach_absolute_time(); e.caller = __builtin_return_address(0);
-	return FunctionCast(xeRecSubmitBatchBuffer, gOrgSubmitBb)(ring, addr, seq, hdr, flags, b1, b2);
-}
 // IGAccelFIFOChannel::submitBuffer(IOAccelCommandDescriptor*): por onde passam os lotes do pool (desc+0x18 gpu, +0x20 cpu,
 // +0x30 dwords) e os dos processos; guarda para achar o ponteiro de CPU do lote travado e ler o que a CPU escreveu.
 struct XeCd { void *ch; uint64_t gpu, cpu; uint32_t ndw; int pid; uint64_t t; };
@@ -13322,9 +13311,48 @@ static uint64_t xeRecChSubmitBuffer(void *ch, uint8_t *desc) {
 	}
 	return FunctionCast(xeRecChSubmitBuffer, gOrgChSubmit)(ch, desc);
 }
+// xe/cmdflush (02/11, experimento): hipótese = o preâmbulo escrito pelo kernel no pool (548 B, cruzando a fronteira de
+// página em +0x40) ainda não está visível à GPU quando o anel é cutucado (escrita em cache/WC sem flush; o SecurityAgent
+// escreve os lotes dele em memória própria e nunca trava). Antes de escrever o BB_START no anel, clflush das linhas do lote
+// (+64 B para o MI_BATCH_BUFFER_END que a Apple acrescenta) e mfence. -ngreennocmdflush desliga.
+static volatile uint32_t gXeFlushN = 0;
+static int gXeFlushOn = -1;
+struct XeBb { void *ring; uint64_t addr; uint32_t seq, hdr; int pid; uint8_t type; int8_t sidx; uint8_t flushed; uint64_t t; void *caller; };
+static XeBb gXeBbs[128];
+static volatile uint32_t gXeBbN = 0;
+static mach_vm_address_t gOrgSubmitBb = 0;
+static uint64_t xeRecSubmitBatchBuffer(void *ring, uint64_t addr, uint32_t seq, uint32_t *hdr, uint32_t flags, bool b1, bool b2) {
+	auto *r = static_cast<uint8_t *>(ring);
+	auto &e = gXeBbs[gXeBbN++ % 128];
+	e.ring = ring; e.addr = addr; e.seq = seq; e.hdr = hdr ? *hdr : 0; e.pid = proc_selfpid(); e.type = r ? r[0x40] : 0xff;
+	e.sidx = r ? (int8_t)*reinterpret_cast<int *>(r + 0x38) : -1; e.t = mach_absolute_time(); e.caller = __builtin_return_address(0);
+	e.flushed = 0;
+	if (gXeFlushOn < 0) gXeFlushOn = checkKernelArgument("-ngreennocmdflush") ? 0 : 1;
+	if (gXeFlushOn == 1) {
+		uint32_t n = gXeCdN;
+		for (uint32_t k = n; k-- > (n > 8 ? n - 8 : 0);) {
+			auto &c = gXeCds[k % 128];
+			if (c.gpu != addr || c.cpu < 0xffffff8000000000ULL || !c.ndw || c.ndw > 0x10000) continue;
+			uint64_t p = c.cpu & ~63ULL, end = c.cpu + c.ndw * 4ULL + 64;
+			for (; p < end; p += 64) __asm__ volatile("clflush (%0)" ::"r"(p) : "memory");
+			__asm__ volatile("mfence" ::: "memory");
+			e.flushed = 1; gXeFlushN++;
+			if (gXeFlushN <= 3) IOLog("XeNG CMDFLUSH: lote gpu %llx cpu %llx %u B (n=%u)\n", addr, c.cpu, c.ndw * 4, gXeFlushN);
+			break;
+		}
+	}
+	return FunctionCast(xeRecSubmitBatchBuffer, gOrgSubmitBb)(ring, addr, seq, hdr, flags, b1, b2);
+}
+uint32_t xePoolSizeOf(uint64_t cpu, int *idx);  // kern_green.cpp
+static void xeBbDw(const char *rot, uint64_t cpu, uint64_t gpu, int n) {
+	auto *d = reinterpret_cast<const volatile uint32_t *>(cpu);
+	IOLog("XeNG BBTRACE:  %s gpu %llx: %08x %08x %08x %08x %08x %08x %08x %08x\n", rot, gpu, d[0], d[1], d[2], d[3], n > 4 ? d[4] : 0,
+	      n > 5 ? d[5] : 0, n > 6 ? d[6] : 0, n > 7 ? d[7] : 0);
+}
 static void xeBbDump(void *ring, uint32_t acthd, uint32_t bb) {
+	bb &= ~3u;
 	uint32_t n = gXeBbN, shown = 0;
-	IOLog("XeNG BBTRACE: anel %llx ACTHD %08x BB %08x, %u submissoes ao anel\n", (uint64_t)ring, acthd, bb, n);
+	IOLog("XeNG BBTRACE: anel %llx ACTHD %08x BB %08x, %u submissoes ao anel, flushes=%u\n", (uint64_t)ring, acthd, bb, n, gXeFlushN);
 	for (uint32_t k = (n > 128 ? n - 128 : 0); k < n; k++) {
 		auto &e = gXeBbs[k % 128];
 		bool ult = k + 4 >= n;
@@ -13332,22 +13360,29 @@ static void xeBbDump(void *ring, uint32_t acthd, uint32_t bb) {
 		if (e.ring == ring && ++shown + 16 < 128 && n - k > 16 && !ult) continue;  // só as 16 últimas do anel travado
 		char nome[32] = "?";
 		proc_name(e.pid, nome, sizeof(nome));
-		IOLog("XeNG BBTRACE:  #%u anel %llx t%u s%d gpu %llx seq %u hdr %08x pid %d %s chamador %llx%s%s\n", k, (uint64_t)e.ring, e.type, e.sidx,
-		      e.addr, e.seq, e.hdr, e.pid, nome, (uint64_t)e.caller, (bb >= e.addr && bb < e.addr + 0x2000) ? " <- BB" : "",
+		IOLog("XeNG BBTRACE:  #%u anel %llx t%u s%d gpu %llx seq %u hdr %08x pid %d %s fl=%u chamador %llx%s%s\n", k, (uint64_t)e.ring, e.type, e.sidx,
+		      e.addr, e.seq, e.hdr, e.pid, nome, e.flushed, (uint64_t)e.caller, (bb >= e.addr && bb < e.addr + 0x2000) ? " <- BB" : "",
 		      e.ring == ring ? "" : " (outro anel)");
 	}
 	n = gXeCdN;
 	for (uint32_t k = (n > 128 ? n - 128 : 0); k < n; k++) {
 		auto &e = gXeCds[k % 128];
-		if (!(bb >= e.gpu && bb < e.gpu + e.ndw * 4ULL + 0x40) && !(acthd >= e.gpu && acthd < e.gpu + e.ndw * 4ULL + 0x40) && k + 3 < n) continue;
+		uint64_t end = e.gpu + e.ndw * 4ULL;
+		bool temBb = bb >= e.gpu && bb < end + 0x40, temAct = acthd >= e.gpu && acthd < end + 0x40;
+		if (!temBb && !temAct && k + 3 < n) continue;
 		char nome[32] = "?";
 		proc_name(e.pid, nome, sizeof(nome));
-		IOLog("XeNG BBTRACE:  desc #%u canal %llx gpu %llx+%x cpu %llx pid %d %s\n", k, (uint64_t)e.ch, e.gpu, e.ndw * 4, e.cpu, e.pid, nome);
-		if (e.cpu >= 0xffffff8000000000ULL && bb >= e.gpu && bb < e.gpu + e.ndw * 4ULL + 0x40) {
-			auto *d = reinterpret_cast<const volatile uint32_t *>(e.cpu + (bb - e.gpu));
-			IOLog("XeNG BBTRACE:  cpu no BB: %08x %08x %08x %08x %08x %08x %08x %08x | fim-8: ", d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
-			auto *f = reinterpret_cast<const volatile uint32_t *>(e.cpu + e.ndw * 4ULL - 32);
-			IOLog("%08x %08x %08x %08x %08x %08x %08x %08x\n", f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+		int pidx = -1; uint32_t psz = xePoolSizeOf(e.cpu, &pidx);
+		IOLog("XeNG BBTRACE:  desc #%u canal %llx gpu %llx+%x cpu %llx pid %d %s pool buf %d/%u KB%s%s\n", k, (uint64_t)e.ch, e.gpu, e.ndw * 4, e.cpu,
+		      e.pid, nome, pidx, psz >> 10, temBb ? " <- BB" : "", temAct ? " <- ACTHD" : "");
+		if (e.cpu >= 0xffffff8000000000ULL && (temBb || temAct)) {
+			uint64_t base = e.cpu - e.gpu;  // cpu = gpu + base, válido dentro do buffer do pool
+			xeBbDw("BB      ", base + bb, bb, 8);
+			xeBbDw("BB+32   ", base + bb + 32, bb + 32, 8);
+			uint64_t pg = (bb + 0x1000) & ~0xfffULL;
+			if (pg < end + 0x40) { xeBbDw("pagina  ", base + pg, pg, 8); xeBbDw("pag+32  ", base + pg + 32, pg + 32, 8); }
+			if (acthd >= e.gpu + 16 && acthd < end + 0x40) xeBbDw("acthd-16", base + acthd - 16, acthd - 16, 8);
+			xeBbDw("fim-16  ", base + end - 16, end - 16, 8);  // últimos 4 dwords do lote + 4 depois (BB_END da Apple?)
 		}
 	}
 }
