@@ -420,7 +420,8 @@ void xeSubDump(uint64_t acthd, uint64_t bb) {
 uint32_t xePoolSizeOf(uint64_t cpu, int *idx, uint64_t *outBase) {
 	for (uint32_t j = 0; j < gXePoolN; j++) {
 		auto *p = static_cast<uint8_t *>(gXePools[j].pool);
-		for (int i = 0; p && i < gXePools[j].count && i < 256; i++) {
+		if (!p) continue;
+		for (int i = 0; i < gXePools[j].count && i < 256; i++) {
 			uint64_t base = *reinterpret_cast<uint64_t *>(p + 0x40 + 24 * (uint64_t)i);
 			if (base && cpu >= base && cpu < base + (uint64_t)gXePools[j].size) {
 				if (idx) *idx = i;
@@ -430,6 +431,17 @@ uint32_t xePoolSizeOf(uint64_t cpu, int *idx, uint64_t *outBase) {
 		}
 	}
 	return 0;
+}
+
+// xe/poolfree (02/11): o pool de um processo que sai é liberado (IOAccelCommandBufferPool2::free) e a tabela ficava com
+// o ponteiro velho, lido a cada submissão pelo xePoolSizeOf (morte súbita 14:43:43 no segundo em que o gpustress saiu?).
+// Tira da tabela antes de liberar.
+static mach_vm_address_t orgPoolFree = 0;
+static void wrapPoolFree(void *that) {
+	for (uint32_t j = 0; j < gXePoolN; j++)
+		if (gXePools[j].pool == that) { gXePools[j].pool = nullptr; gXePools[j].count = 0; gXePools[j].size = 0; }
+	for (uint32_t k = 0; k < 64; k++) if (gXeSubs[k].pool == that) gXeSubs[k].pool = nullptr;
+	FunctionCast(wrapPoolFree, orgPoolFree)(that);
 }
 
 static mach_vm_address_t orgPoolInit = 0;
@@ -463,6 +475,7 @@ static bool wrapPoolInit(void *that, void *accel, void *channel, void *task, int
 	if (ok && that) {  // xe/subtrace: tabela dos pools (reusa a vaga se o mesmo objeto for iniciado de novo)
 		uint32_t j = 0;
 		while (j < gXePoolN && gXePools[j].pool != that) j++;
+		if (j == gXePoolN) { uint32_t v = 0; while (v < gXePoolN && gXePools[v].pool) v++; if (v < gXePoolN) j = v; }  // reusa vaga livre
 		if (j < 48) { gXePools[j] = {that, count, novo}; if (j == gXePoolN) gXePoolN++; }
 	}
 	return ok;
@@ -724,6 +737,7 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			 wrapPoolInit, orgPoolInit},
 			{"__ZN25IOAccelCommandBufferPool217getBufferPtrNoIncEj", wrapPoolGetPtr, orgPoolGetPtr},
 			{"__ZN25IOAccelCommandBufferPool212submitBufferEv", wrapPoolSubmit, orgPoolSubmit},  // xe/subtrace
+			{"__ZN25IOAccelCommandBufferPool24freeEv", wrapPoolFree, orgPoolFree},  // xe/poolfree
 		};
 		if (RouteRequestPlus::routeAll(patcher, index, poolRequest, address, size)) {
 			IOLog("XeNG POOL: hook IOAccelCommandBufferPool2::init OK\n");
