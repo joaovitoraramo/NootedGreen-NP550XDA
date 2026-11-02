@@ -13333,12 +13333,25 @@ struct XeBb { void *ring; uint64_t addr; uint32_t seq, hdr; int pid; uint8_t typ
 static XeBb gXeBbs[128];
 static volatile uint32_t gXeBbN = 0;
 static mach_vm_address_t gOrgSubmitBb = 0;
+// xe/bbcopy: cópia do início de cada lote do RCS no momento do envio. Os lotes do VTDecoderXPCService não vêm do
+// IOAccelCommandBufferPool2 (pool buf -1), então não dá para reconstruir o ponteiro de CPU na hora do reset. Só lê a
+// partir de `hdr`, que o próprio envio acabou de desreferenciar, e nunca passa da página dele.
+struct XeBbC { uint64_t addr; int pid; uint32_t n; uint32_t dw[160]; };
+static XeBbC gXeBbCs[64];
+static volatile uint32_t gXeBbCN = 0;
+static void xeBbCopy(uint64_t addr, const uint32_t *hdr) {
+	auto &c = gXeBbCs[gXeBbCN++ % 64];
+	uint32_t room = (uint32_t)((0x1000 - ((uint64_t)hdr & 0xfff)) / 4), n = room < 160 ? room : 160;
+	c.addr = addr; c.pid = proc_selfpid(); c.n = n;
+	for (uint32_t i = 0; i < n; i++) c.dw[i] = hdr[i];
+}
 static uint64_t xeRecSubmitBatchBuffer(void *ring, uint64_t addr, uint32_t seq, uint32_t *hdr, uint32_t flags, bool b1, bool b2) {
 	auto *r = static_cast<uint8_t *>(ring);
 	auto &e = gXeBbs[gXeBbN++ % 128];
 	e.ring = ring; e.addr = addr; e.seq = seq; e.hdr = hdr ? *hdr : 0; e.pid = proc_selfpid(); e.type = r ? r[0x40] : 0xff;
 	e.sidx = r ? (int8_t)*reinterpret_cast<int *>(r + 0x38) : -1; e.t = mach_absolute_time(); e.caller = __builtin_return_address(0);
 	e.flushed = 0;
+	if (hdr && r && r[0x40] == 0) xeBbCopy(addr, hdr);
 	// 02/11 12:39: com o flush ligado a máquina morreu de vez (log e ps param no mesmo segundo, sem hang de GPU, sem relatório):
 	// suspeita de clflush em ponteiro de CPU já solto -> page fault no kernel. Agora só liga com -ngreencmdflush.
 	if (gXeFlushOn < 0) gXeFlushOn = checkKernelArgument("-ngreencmdflush") ? 1 : 0;
@@ -13365,8 +13378,24 @@ static void xeBbDw(const char *rot, uint64_t cpu, uint64_t gpu, int n) {
 // BB_ADDR é a posição ATUAL do lote (≈ ACTHD), não o início. O início só está no anel; então lista os descritores com
 // endereço até 256 KB abaixo do ACTHD (os candidatos a lote travado), com o buffer do pool de cada um e se o lote
 // passa do fim do buffer, e lê pela CPU o início, a página seguinte e o fim do lote.
+static void xeBbCopyDump(uint32_t acthd, uint32_t bb) {
+	uint32_t key = acthd ? acthd : bb, n = gXeBbCN, shown = 0;
+	for (uint32_t k = n; k-- > (n > 64 ? n - 64 : 0) && shown < 3;) {
+		auto &c = gXeBbCs[k % 64];
+		if (c.addr > key || key - c.addr >= 0x40000) continue;
+		shown++;
+		char nome[32] = "?";
+		proc_name(c.pid, nome, sizeof(nome));
+		IOLog("XeNG BBCOPY: lote gpu %llx pid %d %s: posicao %x dentro dele, %u dwords copiados no envio\n", c.addr, c.pid, nome, (uint32_t)(key - c.addr), c.n);
+		for (uint32_t i = 0; i + 8 <= c.n; i += 8)
+			IOLog("XeNG BBCOPY:  +%03x %08x %08x %08x %08x %08x %08x %08x %08x\n", i * 4, c.dw[i], c.dw[i + 1], c.dw[i + 2], c.dw[i + 3], c.dw[i + 4],
+			      c.dw[i + 5], c.dw[i + 6], c.dw[i + 7]);
+	}
+	if (!shown) IOLog("XeNG BBCOPY: nenhum lote copiado ate 256 KB abaixo de %08x (%u copias)\n", key, n);
+}
 static void xeBbDump(void *ring, uint32_t acthd, uint32_t bb) {
 	bb &= ~3u;
+	xeBbCopyDump(acthd, bb);
 	uint32_t n = gXeBbN, shown = 0;
 	IOLog("XeNG BBTRACE: anel %llx ACTHD %08x BB %08x, %u submissoes ao anel, flushes=%u\n", (uint64_t)ring, acthd, bb, n, gXeFlushN);
 	for (uint32_t k = (n > 128 ? n - 128 : 0); k < n; k++) {
