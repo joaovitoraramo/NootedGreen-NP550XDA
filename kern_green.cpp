@@ -355,6 +355,67 @@ void NGreen::setApertureIfNecessary() {
 // submete o buffer pela metade quando falta espaço) e a GPU lê a página seguinte ainda com veneno 0xc01dbead.
 // O TGL pede até 0x3ffe dwords de uma vez. Aqui: registra cada pool criado (quantidade, tamanho, reserva, chamador) e,
 // com -ngreenxefix, garante pelo menos 128 KB por buffer (desliga com -ngreennopoolfix).
+// xe/subtrace (02/11, NP550): dois hangs na tela de login (00:13 e 10:21) com o mesmo desenho: lote do blit3d do kernel
+// começando 0x40 bytes antes de uma fronteira de página (…fc0), GPU seguindo pela página seguinte como se fosse MI_NOOP
+// (zeros) até ler veneno 0xc01dbead no fim do buffer (IPEHR=c01dbead, EIR=1). Para saber se a CPU escreveu o lote
+// inteiro (então é a GPU que vê outra página: mapeamento/coerência) ou se o lote foi mesmo cortado (pool), guarda as
+// últimas submissões de cada pool (IOAccelCommandBufferPool2::submitBuffer: descritor em pool+0x1860: +0x18 endereço
+// GPU, +0x20 ponteiro CPU, +0x30 dwords) e os pools criados; xeSubDump() é chamado pelo XE-GPUREC antes do reset.
+struct XeSub { void *pool; uint64_t gpu, cpu; uint32_t ndw; int16_t idx; uint64_t t; };
+static XeSub gXeSubs[64];
+static volatile uint32_t gXeSubN = 0;
+struct XePool { void *pool; int count, size; };
+static XePool gXePools[48];
+static uint32_t gXePoolN = 0;
+static mach_vm_address_t orgPoolSubmit = 0;
+static void wrapPoolSubmit(void *that) {
+	auto *p = static_cast<uint8_t *>(that);
+	int16_t idx = p ? *reinterpret_cast<int16_t *>(p + 0x1842) : -1;
+	FunctionCast(wrapPoolSubmit, orgPoolSubmit)(that);
+	auto *desc = p ? *reinterpret_cast<uint8_t **>(p + 0x1860) : nullptr;
+	if (!desc) return;
+	auto &s = gXeSubs[gXeSubN++ % 64];
+	s.pool = that; s.gpu = *reinterpret_cast<uint64_t *>(desc + 0x18); s.cpu = *reinterpret_cast<uint64_t *>(desc + 0x20);
+	s.ndw = *reinterpret_cast<uint32_t *>(desc + 0x30); s.idx = idx; s.t = mach_absolute_time();
+}
+static void xeSubDumpDwords(const char *rot, uint64_t cpu, uint64_t gpu, int n) {
+	auto *d = reinterpret_cast<const volatile uint32_t *>(cpu);
+	IOLog("XeNG SUBTRACE:  %s gpu %llx cpu %llx: %08x %08x %08x %08x %08x %08x %08x %08x\n", rot, gpu, cpu,
+	      d[0], d[1], d[2], d[3], n > 4 ? d[4] : 0, n > 5 ? d[5] : 0, n > 6 ? d[6] : 0, n > 7 ? d[7] : 0);
+}
+// Chamado pelo XE-GPUREC (kern_gen11.cpp) antes do reset do RCS com ACTHD e BB_ADDR lidos do MMIO.
+void xeSubDump(uint64_t acthd, uint64_t bb) {
+	uint32_t n = gXeSubN;
+	IOLog("XeNG SUBTRACE: ACTHD %llx BB %llx, %u submissoes, %u pools\n", acthd, bb, n, gXePoolN);
+	for (uint32_t k = (n > 8 ? n - 8 : 0); k < n; k++) {
+		auto &s = gXeSubs[k % 64];
+		IOLog("XeNG SUBTRACE:  #%u pool %p idx %d gpu %llx+%x cpu %llx%s\n", k, s.pool, s.idx, s.gpu, s.ndw * 4, s.cpu,
+		      (acthd >= s.gpu && acthd < s.gpu + (uint64_t)s.ndw * 4 + 8) ? " <- ACTHD dentro" : "");
+	}
+	// o lote mais recente cujo buffer (128 KB no máximo) contém o ACTHD: lê pela CPU o início, o fim e a posição do ACTHD
+	for (uint32_t k = n; k-- > (n > 64 ? n - 64 : 0);) {
+		auto &s = gXeSubs[k % 64];
+		int size = 0;
+		for (uint32_t j = 0; j < gXePoolN; j++) if (gXePools[j].pool == s.pool) size = gXePools[j].size;
+		if (!s.pool || s.idx < 0 || !size) continue;
+		uint64_t bufCpu = *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(s.pool) + 0x40 + 24 * (uint64_t)s.idx);
+		if (!bufCpu || s.cpu < bufCpu || s.cpu >= bufCpu + (uint64_t)size) continue;
+		uint64_t bufGpu = s.gpu - (s.cpu - bufCpu);
+		if (acthd < bufGpu || acthd >= bufGpu + (uint64_t)size) continue;
+		IOLog("XeNG SUBTRACE: lote #%u no buffer idx %d gpu %llx..%llx (cpu %llx), ACTHD a %+lld do inicio, lote de %u B\n", k, s.idx,
+		      bufGpu, bufGpu + size, bufCpu, (long long)(acthd - s.gpu), s.ndw * 4);
+		xeSubDumpDwords("inicio ", s.cpu, s.gpu, 8);
+		uint64_t end = s.cpu + (uint64_t)s.ndw * 4;
+		if (end + 16 <= bufCpu + size) xeSubDumpDwords("fim-16 ", end - 16, s.gpu + s.ndw * 4 - 16, 8);
+		uint64_t a = bufCpu + (acthd - bufGpu);
+		if (a >= bufCpu + 16 && a + 16 <= bufCpu + size) xeSubDumpDwords("acthd-16", a - 16, acthd - 16, 8);
+		// a página anterior à do ACTHD e a primeira linha de cada página entre o lote e o ACTHD (zeros = o que a GPU viu?)
+		for (uint64_t pg = (s.gpu + 0xfff) & ~0xfffULL; pg <= (acthd & ~0xfffULL) && pg < bufGpu + size; pg += 0x1000)
+			xeSubDumpDwords("pagina  ", bufCpu + (pg - bufGpu), pg, 8);
+		break;
+	}
+}
+
 static mach_vm_address_t orgPoolInit = 0;
 static bool wrapPoolInit(void *that, void *accel, void *channel, void *task, int count, int bufSize, uint32_t a,
 						 uint32_t b, uint32_t c, uint32_t reserve) {
@@ -382,7 +443,13 @@ static bool wrapPoolInit(void *that, void *accel, void *channel, void *task, int
 		IOLog("XeNG POOL[%d] init count=%d size=0x%x->0x%x a=0x%x b=0x%x c=0x%x reserve=0x%x caller=%p\n", nlog, count,
 			  bufSize, novo, a, b, c, reserve, __builtin_return_address(0));
 	}
-	return FunctionCast(wrapPoolInit, orgPoolInit)(that, accel, channel, task, count, novo, a, b, c, reserve);
+	bool ok = FunctionCast(wrapPoolInit, orgPoolInit)(that, accel, channel, task, count, novo, a, b, c, reserve);
+	if (ok && that) {  // xe/subtrace: tabela dos pools (reusa a vaga se o mesmo objeto for iniciado de novo)
+		uint32_t j = 0;
+		while (j < gXePoolN && gXePools[j].pool != that) j++;
+		if (j < 48) { gXePools[j] = {that, count, novo}; if (j == gXePoolN) gXePoolN++; }
+	}
+	return ok;
 }
 
 // xe/pool (19/10): o blit3d do TGL calcula a posição do estado (surface states, binding table) supondo que o
@@ -620,6 +687,7 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			{"__ZN25IOAccelCommandBufferPool24initEP22IOGraphicsAccelerator2P15IOAccelChannel2P11IOAccelTaskiijjjj",
 			 wrapPoolInit, orgPoolInit},
 			{"__ZN25IOAccelCommandBufferPool217getBufferPtrNoIncEj", wrapPoolGetPtr, orgPoolGetPtr},
+			{"__ZN25IOAccelCommandBufferPool212submitBufferEv", wrapPoolSubmit, orgPoolSubmit},  // xe/subtrace
 		};
 		if (RouteRequestPlus::routeAll(patcher, index, poolRequest, address, size)) {
 			IOLog("XeNG POOL: hook IOAccelCommandBufferPool2::init OK\n");

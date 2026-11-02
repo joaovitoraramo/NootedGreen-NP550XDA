@@ -13283,6 +13283,32 @@ static uint32_t xeRecExFix(void *acc, volatile uint8_t *mmio) {
 	if (did) { (void)xeRecRd(mmio, kXeRecEx[0]); gRecExFix++; }
 	return did;
 }
+// xe/hangdiag (02/11, NP550): tela de login congelou às 00:13 com o RCS em "instruction error" (IPEHR=c01dbead) e depois
+// IGAccelFIFOChannel::resetHardwareAndReplay ficou em laço sem fim: reset -> submitStampCommand -> sleepForStamp(1 s)
+// -> timeout -> reset... (contador em ctx+0x17c nunca é limitado). Antes do reset lê o que a GPU executava e pede ao
+// xe/subtrace (kern_green.cpp) o lote correspondente visto pela CPU; depois do reset registra os registradores do RCS;
+// e conta os timeouts de 1 s do sleepForStamp para ver se o carimbo chega a andar.
+void xeSubDump(uint64_t acthd, uint64_t bb);  // kern_green.cpp
+static uint32_t gRecStorm = 0;
+static uint64_t gRecAbs3s = 0;
+static mach_vm_address_t gOrgSleepStamp = 0;
+static bool xeRecSleepForStamp(void *ring, uint32_t *out, uint32_t want, uint32_t us) {
+	bool to = FunctionCast(xeRecSleepForStamp, gOrgSleepStamp)(ring, out, want, us);
+	static uint32_t n = 0;
+	if (us != 1000000 || gRecResets == 0) return to;
+	auto *r = static_cast<uint8_t *>(ring);
+	if (to) {
+		n++;
+		if (n <= 8 || !(n & 63))
+			IOLog("XeNG STAMPWAIT: anel %p tipo %u idx %d quer %u tem %u: timeout de 1 s (n=%u)\n", ring, r ? r[0x40] : 0xff,
+			      r ? *reinterpret_cast<int *>(r + 0x38) : -1, want, out ? *out : 0, n);
+	} else if (n) {
+		IOLog("XeNG STAMPWAIT: carimbo chegou depois de %u timeouts (quer %u tem %u)\n", n, want, out ? *out : 0);
+		n = 0;
+	}
+	return to;
+}
+
 // IGScheduler5::processGPUReset is called by resetGraphicsEngine right after GDRST + list restore (file 0x43842) and by
 // our sibling replay. Re-enable the CCS before Apple resubmits to ELSP.
 static void xeRecProc(void *sched, uint32_t type, void *ctx) {
@@ -13318,11 +13344,31 @@ static bool xeRecResetGraphicsEngine(void *ring, void *ctx) {
 	auto *eng = *reinterpret_cast<uint8_t **>(r + 0x8b8 + (uint64_t)type * 8);
 	bool kick = eng && (*reinterpret_cast<uint32_t *>(eng + 0xa4) & 0xc);
 
+	// xe/hangdiag: o que o RCS executava (com forcewake já segurado acima) e o lote do pool visto pela CPU
+	{
+		if (!gRecAbs3s) nanoseconds_to_absolutetime(3000000000ULL, &gRecAbs3s);
+		static uint64_t lastT = 0;
+		uint64_t now = mach_absolute_time();
+		gRecStorm = (lastT && now - lastT < gRecAbs3s) ? gRecStorm + 1 : 0;
+		lastT = now;
+		if (own == 0 && (gRecResets < 12 || gRecStorm < 4 || !(gRecStorm & 63))) {
+			uint32_t acthd = xeRecRd(mmio, 0x2074), bb = xeRecRd(mmio, 0x2140), ipehr = xeRecRd(mmio, 0x2068);
+			IOLog("XeNG HANGDIAG: antes do reset #%u storm=%u ACTHD %08x BB %08x IPEHR %08x EIR %08x ESR %08x HEAD %05x TAIL %05x ELSTAT %08x/%08x\n",
+			      gRecResets + 1, gRecStorm, acthd, bb, ipehr, xeRecRd(mmio, 0x20b0), xeRecRd(mmio, 0x20b8), xeRecRd(mmio, 0x2034),
+			      xeRecRd(mmio, 0x2030), xeRecRd(mmio, 0x2234), xeRecRd(mmio, 0x2238));
+			xeSubDump(acthd, bb);
+		}
+	}
 	xeRecExSnapshot(acc, mmio);
 	gRecPendAcc = acc; gRecPendMmio = mmio;     // xeRecProc() re-applies the extras between GDRST and Apple's replay
 	bool ret = orig(ring, ctx);
 	gRecPendAcc = nullptr; gRecPendMmio = nullptr;
 	uint32_t exDid = xeRecExFix(acc, mmio);   // no-op if xeRecProc already did it
+	if (own == 0 && (gRecResets < 12 || gRecStorm < 4 || !(gRecStorm & 63)))  // xe/hangdiag: estado do RCS logo depois do reset
+		IOLog("XeNG HANGDIAG: depois do reset ret=%d CTL %08x HEAD %05x TAIL %05x START %08x HWS %08x GFXMODE %08x ELSTAT %08x/%08x EIR %08x ESR %08x INSTDONE %08x RCU %08x GDRST %08x\n",
+		      ret, xeRecRd(mmio, 0x203c), xeRecRd(mmio, 0x2034), xeRecRd(mmio, 0x2030), xeRecRd(mmio, 0x2038), xeRecRd(mmio, 0x2080),
+		      xeRecRd(mmio, 0x229c), xeRecRd(mmio, 0x2234), xeRecRd(mmio, 0x2238), xeRecRd(mmio, 0x20b0), xeRecRd(mmio, 0x20b8),
+		      xeRecRd(mmio, 0x206c), xeRecRd(mmio, 0x14800), xeRecRd(mmio, 0x941c));
 
 	uint32_t sibHws = xeRecRd(mmio, xeRecReg(sd, 0));
 	bool lost = snap[0] ? (sibHws == 0) : true;
@@ -13513,6 +13559,11 @@ static void xeGpuRecInstall(KernelPatcher &patcher, size_t index, mach_vm_addres
 		}
 	}
 	if (gRecOn == 1) xeStfInstall(patcher, index, address, size);  // xe/stampfix (01/11)
+	if (gRecOn == 1) {  // xe/hangdiag (02/11): contagem dos timeouts de 1 s do laço de resetHardwareAndReplay
+		RouteRequestPlus sw[] = {{"__ZN20IGHardwareRingBuffer13sleepForStampEPjjj", xeRecSleepForStamp, gOrgSleepStamp}};
+		if (!RouteRequestPlus::routeAll(patcher, index, sw, address, size)) patcher.clearError();
+		SYSLOG("ngreen", "XE-HANGDIAG: sleepForStamp route=%d", gOrgSleepStamp != 0);
+	}
 	SYSLOG("ngreen", "XE-GPUREC: sym rge=%d sfw=%d def=%d s5=%d cs5=%d lists=%d/%d(n=%llu/%llu) sig=%d%d%d%d%d%d route=%d ex=%d",
 	       rge != 0, gRecSfw != 0, gRecGetDef != 0, gRecS5Proc != 0, cs5Proc != 0, l0, l1, n0, n1, sig1, sig2, sig3, sig4, sig5, sig6, gRecOn, gRecExOn);
 }
