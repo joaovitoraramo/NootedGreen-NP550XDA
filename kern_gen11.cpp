@@ -13368,6 +13368,91 @@ static bool xeRecResetGraphicsEngine(void *ring, void *ctx) {
 	return ret;
 }
 
+// ─── xe/stampfix (01/11, NP550 TGL real): stamp do irmão perdido no reset do domínio de render ────────────────────
+// Visto duas vezes depois de um XE-GPUREC com restore=1 replay=1: o trabalho que estava em voo no motor IRMÃO (o que não
+// travou) é descartado pelo GDRST e o replay não o reenvia nem o retira. O stamp desse índice fica "enviado N,
+// retornado N-1" para sempre; o IOAF chama IGAccelEventMachine::eventTimeout a cada ~5 s, que não acha contexto ativo
+// naquele motor (caminho IGTimeoutReason 4) e devolve NULL -> "GPURestartSkipped / no channel associated with
+// stamp_idx N". Só sai do loop se alguém enviar trabalho novo no mesmo índice (stamps são monotônicos). Em 01/11:
+// CCS(25) perdido depois de reset do RCS pelo Aerial -> WindowServer esperando -> congelamento total em 4 min; RCS(1)
+// perdido depois de reset do CCS pelo mediaanalysisd -> loop de 60 s até o WindowServer enviar algo.
+// Memória dos stamps (IGHardwareRingBuffer::dumpStampInfo / IntelAccelerator::signalStampUpdate): base =
+// IGAccelTask::getStamps(accel->0x150), 64 B por índice, +0 = retornado (escrito pela GPU), +8 = enviado.
+// Correção: só depois de um reset do XE-GPUREC, quando eventTimeout devolve NULL para o mesmo índice e o mesmo valor
+// enviado duas vezes seguidas e o motor dele não tem contexto ativo, escreve retornado = enviado (o que a GPU teria
+// escrito) e avisa os que esperam com IntelAccelerator::signalStampUpdate. -ngreennostampfix desliga.
+static mach_vm_address_t gOrgEvTo = 0, gStfGetStamps = 0, gStfSignal = 0, gStfActive = 0;
+static const uint8_t *gStfLut = nullptr, *gStfLutSci = nullptr;
+static int gStfOn = 0;
+static uint32_t gStfIdx = ~0u, gStfVal = 0, gStfN = 0;
+static volatile uint32_t gStfFix = 0, gStfLast = 0;
+
+static void *xeStfEventTimeout(void *em, int idx) {
+	void *ch = FunctionCast(xeStfEventTimeout, gOrgEvTo)(em, idx);
+	if (ch || gStfOn != 1 || gRecResets == 0 || !em || idx < 0 || idx >= 64) {
+		if (ch) gStfN = 0;
+		return ch;
+	}
+	auto *acc = *reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(em) + 0x10);
+	if (!acc) return ch;
+	if (*reinterpret_cast<int *>(acc + 0x11a0) <= idx && idx <= *reinterpret_cast<int *>(acc + 0x11a4)) return ch;  // display
+	auto *task = *reinterpret_cast<void **>(acc + 0x150);
+	auto *stamps = task ? reinterpret_cast<volatile uint32_t *>(reinterpret_cast<void *(*)(void *)>(gStfGetStamps)(task)) : nullptr;
+	if (!stamps) return ch;
+	volatile uint32_t *st = stamps + (uint32_t)idx * 16;
+	uint32_t ret = st[0], sub = st[2];
+	if (ret == sub || (int32_t)(sub - ret) < 0) { gStfN = 0; return ch; }
+	uint8_t cs = (*reinterpret_cast<uint64_t *>(acc + 0x1190) & 0x18000) ? gStfLutSci[idx] : gStfLut[idx];
+	auto *sched = *reinterpret_cast<uint8_t **>(acc + 0x1250);
+	auto *vt = sched ? *reinterpret_cast<mach_vm_address_t **>(sched) : nullptr;
+	if (!vt || vt[0x198 / 8] != gStfActive) return ch;
+	void *a = nullptr, *b = nullptr; uint64_t t = 0;
+	reinterpret_cast<void (*)(void *, uint32_t, void **, uint64_t *, void **)>(gStfActive)(sched, cs, &a, &t, &b);
+	if (a || b) { gStfN = 0; return ch; }
+	if (gStfIdx == (uint32_t)idx && gStfVal == sub) gStfN++;
+	else { gStfIdx = (uint32_t)idx; gStfVal = sub; gStfN = 1; }
+	if (gStfN < 2) return ch;
+	gStfN = 0;
+	st[0] = sub;
+	gStfFix++;
+	gStfLast = ((uint32_t)idx << 24) | ((uint32_t)cs << 16) | ((sub - ret) & 0xffff);
+	uint64_t bits = 1ULL << idx;
+	reinterpret_cast<void (*)(void *, const uint64_t *)>(gStfSignal)(acc, &bits);
+	IOLog("XeNG STAMPFIX: idx %d cs %u retornado 0x%x -> 0x%x (n=%u)\n", idx, cs, ret, sub, gStfFix);
+	auto *svc = reinterpret_cast<IOService *>(acc);
+	svc->setProperty("xe-rec-stampfix", gStfFix, 32);
+	svc->setProperty("xe-rec-stampfix-last", gStfLast, 32);
+	return ch;
+}
+
+static void xeStfInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	if (checkKernelArgument("-ngreennostampfix")) { SYSLOG("ngreen", "XE-STAMPFIX: off (-ngreennostampfix)"); return; }
+	mach_vm_address_t evto = patcher.solveSymbol(index, "__ZN19IGAccelEventMachine12eventTimeoutEi", address, size); patcher.clearError();
+	gStfGetStamps = patcher.solveSymbol(index, "__ZNK11IGAccelTask9getStampsEv", address, size); patcher.clearError();
+	gStfSignal = patcher.solveSymbol(index, "__ZN16IntelAccelerator17signalStampUpdateERK8IGBitSetILm64EE", address, size); patcher.clearError();
+	gStfActive = patcher.solveSymbol(index, "__ZN12IGScheduler517getActiveContextsE10IGHwCsTypePP17IGHardwareContextPyS3_", address, size); patcher.clearError();
+	bool sig = false;
+	if (evto) {
+		// +0x3b: leaq LUT_SCI(%rip),%rsi; +0x45: leaq LUT(%rip),%rbx; +0x59: movq 0x1250(%rax),%rdi
+		auto *f = reinterpret_cast<const uint8_t *>(evto);
+		static const uint8_t sSci[] = {0x48, 0x8d, 0x35}, sLut[] = {0x48, 0x8d, 0x1d}, sSched[] = {0x48, 0x8b, 0xb8, 0x50, 0x12, 0x00, 0x00};
+		if (!memcmp(f + 0x3b, sSci, 3) && !memcmp(f + 0x45, sLut, 3) && !memcmp(f + 0x59, sSched, sizeof(sSched))) {
+			gStfLutSci = f + 0x42 + *reinterpret_cast<const int32_t *>(f + 0x3e);
+			gStfLut = f + 0x4c + *reinterpret_cast<const int32_t *>(f + 0x48);
+			sig = true;
+		}
+	}
+	if (evto && gStfGetStamps && gStfSignal && gStfActive && sig) {
+		RouteRequestPlus r[] = {
+			{"__ZN19IGAccelEventMachine12eventTimeoutEi", xeStfEventTimeout, gOrgEvTo},
+		};
+		if (RouteRequestPlus::routeAll(patcher, index, r, address, size) && gOrgEvTo) gStfOn = 1;
+		else patcher.clearError();
+	}
+	SYSLOG("ngreen", "XE-STAMPFIX: sym evto=%d stamps=%d signal=%d active=%d sig=%d lut=%u/%u route=%d", evto != 0, gStfGetStamps != 0,
+	       gStfSignal != 0, gStfActive != 0, sig, gStfLut ? gStfLut[1] : 0xff, gStfLut ? gStfLut[25] : 0xff, gStfOn);
+}
+
 // Route installer (called from processKext). All addresses are runtime; every assumption is checked by bytes first.
 static void xeGpuRecInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	if (checkKernelArgument("-ngreennogpurec")) { SYSLOG("ngreen", "XE-GPUREC: off (-ngreennogpurec)"); return; }
@@ -13427,6 +13512,7 @@ static void xeGpuRecInstall(KernelPatcher &patcher, size_t index, mach_vm_addres
 			else patcher.clearError();
 		}
 	}
+	if (gRecOn == 1) xeStfInstall(patcher, index, address, size);  // xe/stampfix (01/11)
 	SYSLOG("ngreen", "XE-GPUREC: sym rge=%d sfw=%d def=%d s5=%d cs5=%d lists=%d/%d(n=%llu/%llu) sig=%d%d%d%d%d%d route=%d ex=%d",
 	       rge != 0, gRecSfw != 0, gRecGetDef != 0, gRecS5Proc != 0, cs5Proc != 0, l0, l1, n0, n1, sig1, sig2, sig3, sig4, sig5, sig6, gRecOn, gRecExOn);
 }
