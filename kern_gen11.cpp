@@ -57,6 +57,7 @@ static uint32_t hdmiEmuGmbusRead(uint32_t pin, uint32_t offset, uint8_t *buf, ui
 static volatile uint32_t gGmbusPin = 0;   // NP550 HDMIEMU: pino do pedido GMBUS em curso (o FB não grava o GMBUS0)
 #include "AppleIntelParams.hpp"
 #include <Headers/kern_api.hpp>
+#include <sys/sysctl.h>
 #include "kern_genx.hpp"
 #include "kern_green.hpp"
 #include "IntelDPLinkTraining.hpp"
@@ -13465,12 +13466,41 @@ static void xeRecProc(void *sched, uint32_t type, void *ctx) {
 	orig(sched, type, ctx);
 }
 
+// xe/regsysctl (03/11): `sysctl debug.xeng.regs` lê ao vivo registradores do display (contador de quadros, PSR, DC,
+// interrupções do pipe) e alguns da GT, sem esperar um reset. Só leitura.
+static const struct { const char *nome; uint32_t reg; } kXeRegLive[] = {
+	{"frmcount", 0x70040}, {"flipcount", 0x70044}, {"pipeconf", 0x70008}, {"planectl", 0x70180}, {"planesurf", 0x7019c}, {"planelive", 0x701ac},
+	{"psrctl", 0x60800}, {"psrstat", 0x60840}, {"psr2ctl", 0x60900}, {"psr2stat", 0x60940}, {"dcstate", 0x45504},
+	{"pipeisr", 0x44400}, {"pipeimr", 0x44404}, {"pipeiir", 0x44408}, {"pipeier", 0x4440c}, {"dispint", 0x44200}, {"mstrirq", 0x190010},
+	{"rpstat", 0x1381b4}, {"rc6", 0x138108}, {"execstat", 0x2234}, {"csbptr", 0x23a0},
+};
+static int xeRegsSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
+	char b[768]; int o = 0;
+	for (auto &e : kXeRegLive) {
+		uint32_t v = NGreen::callback ? NGreen::callback->readReg32(e.reg) : 0xdeaddead;
+		o += snprintf(b + o, sizeof(b) - (size_t)o, "%s=%08x ", e.nome, v);
+		if (o >= (int)sizeof(b) - 24) break;
+	}
+	return SYSCTL_OUT(req, b, (size_t)o + 1);
+}
+SYSCTL_DECL(_debug);
+SYSCTL_NODE(_debug, OID_AUTO, xeng, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "NootedGreen NP550");
+SYSCTL_PROC(_debug_xeng, OID_AUTO, regs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRegsSysctl, "A", "registradores ao vivo");
+static void xeRegsSysctlInstall() {
+	static bool feito = false;
+	if (feito) return;
+	feito = true;
+	sysctl_register_oid(&sysctl__debug_xeng);
+	sysctl_register_oid(&sysctl__debug_xeng_regs);
+	IOLog("XeNG REGSYSCTL: debug.xeng.regs registrado\n");
+}
 // xe/regdiff: compara registradores da GT antes e depois de um reset do RCS, e entre resets. Depois dos resets com vídeo o
 // WindowServer atualiza a tela 13x menos sem bloquear na GPU (ws-medir.sh): procura o que o reset deixa diferente.
 static const struct { uint32_t ini, fim; } kXeRegFx[] = {
 	{0x2080, 0x2090}, {0x209c, 0x20b0}, {0x20c0, 0x2110}, {0x2220, 0x2240}, {0x2290, 0x22a0},
 	{0x7000, 0x7400}, {0x9400, 0x9440}, {0x94d0, 0x94f0}, {0xa000, 0xa100}, {0xb100, 0xb200},
 	{0xe100, 0xe200}, {0xe400, 0xe500}, {0x190000, 0x1900f0}, {0x44400, 0x44420}, {0x44200, 0x44210},
+	{0x60800, 0x60810}, {0x60840, 0x60844}, {0x60900, 0x60910}, {0x60940, 0x60944}, {0x45504, 0x45508}, {0x70008, 0x7000c}, {0x70180, 0x70184},  // PSR/DC/pipe
 };
 static constexpr uint32_t kXeRegMax = 1400;
 static uint32_t gXeRegAntes[kXeRegMax], gXeRegBase[kXeRegMax];
@@ -13767,6 +13797,7 @@ static void xeStfInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t
 
 // Route installer (called from processKext). All addresses are runtime; every assumption is checked by bytes first.
 static void xeGpuRecInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	xeRegsSysctlInstall();
 	if (checkKernelArgument("-ngreennogpurec")) { SYSLOG("ngreen", "XE-GPUREC: off (-ngreennogpurec)"); return; }
 	mach_vm_address_t rge = patcher.solveSymbol(index, "__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext", address, size);
 	patcher.clearError();
