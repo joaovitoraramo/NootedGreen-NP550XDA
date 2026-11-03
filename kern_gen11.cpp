@@ -13361,8 +13361,8 @@ static uint64_t xeRecSubmitBatchBuffer(void *ring, uint64_t addr, uint32_t seq, 
 	e.flushed = 0;
 	if (hdr && r && r[0x40] == 0) xeBbCopy(addr, hdr);
 	if (r) { gXeAccLive = *reinterpret_cast<void **>(r + 0x10); gXeMmioLive = *reinterpret_cast<volatile uint8_t **>(r + 0x50); }
-	if (r) {   // xe/stampowner (03/11): quem submete em cada índice de stamp (ring+0x20 = índice, cf. processGPUReset)
-		int si = *reinterpret_cast<int *>(r + 0x20);
+	if (r) {   // xe/stampowner (03/11): quem submete em cada índice de stamp (o índice do anel, ring+0x38, é o stamp dele)
+		int si = e.sidx;
 		if (si >= 0 && si < 64) { gStampOwnerPid[si] = e.pid; gStampOwnerRing[si] = e.sidx; gStampOwnerT[si] = e.t; }
 	}
 	if (gRecLastResetT && gRecAbs3s) {   // xe/stampdump: a cada 5 s nos 90 s seguintes a um reset, lista stamps atrasados
