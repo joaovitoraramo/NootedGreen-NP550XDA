@@ -7,7 +7,7 @@ Metal acceleration. The kext source is in the root of this repository (one file 
 `src/NootedGreen`); the diagnostic and test tools we wrote along the way are in `tools/`.
 
 This is a working daily machine as of 2026-11-03: Xcode 26.1.1 + iOS simulator, Docker Desktop, App Store, hardware video
-decode, 9 h 23 min of continuous logged-in use overnight with zero GPU resets. Three problems remain open (see below) and **we are looking for help on them**; the post-reset slowdown was solved on
+decode, 9 h 23 min of continuous logged-in use overnight with zero GPU resets. Four problems remain open (see below) and **we are looking for help on them**; the post-reset slowdown was solved on
 2026-11-03 (GT frequency floor).
 
 ## Hardware and software
@@ -51,6 +51,13 @@ ngreencon3type=2048 -ngreenhdmiemu -ngreenhdmiout -ngreenhdmigammaoff -ngreentgl
 - The idle **login screen with no session** has died 3 times (13 min, 21 min and 112 min after boot): total freeze, no
   panic, no trace in the kernel log, last kernel line is the normal 1 Hz clock blit of SecurityAgent (open problem 1).
 
+## Kexts in the EFI
+
+Lilu 1.7.2, WhateverGreen 1.7.1, this NootedGreen, VirtualSMC 1.3.8 with SMCBatteryManager and SMCProcessor, AppleALC, SimpleHDA,
+AirportItlwm 2.4.0 and itlwm, IntelBluetoothFirmware 2.5.1, IntelBTPatcher, BlueToolFixup 2.7.3, RealtekRTL8111, NVMeFix 1.1.3,
+VoodooI2C 2.8 with VoodooI2CHID, VoodooPS2Controller 2.3.7, BrightnessKeys, ECEnabler, CpuTscSync, RestrictEvents, USBToolBox with
+UTBMap. In `/Library/Extensions`: AppleIntelTGLGraphics 16.0.2 and its framebuffer. Details of HDMI and USB-C: [docs/HDMI-USBC.md](docs/HDMI-USBC.md).
+
 ## Fixes found in this fork (chronological, see `git log`)
 
 | Tag in commits | What it fixes |
@@ -68,7 +75,7 @@ ngreencon3type=2048 -ngreenhdmiemu -ngreenhdmiout -ngreenhdmigammaoff -ngreentgl
 | `XE-GPUREC` v1+v2 | RCS and CCS share the render reset domain (GDRST 0x2) but Apple restores only the engine that hung; the sibling is left with HWS_PGA=0, GFX_MODE=0, its context dropped and the scheduler waiting forever (the old "restart loop + WindowServer dies + watchdog panic"). We snapshot the sibling's reset-register list, restore it after a real GDRST and run `IGScheduler5::processGPUReset` for it. |
 | `XE-STAMPFIX` | After a GPUREC reset, a stamp of the sibling engine is lost in the GDRST (submitted N, returned N-1 forever): complete it and signal waiters. 03/11: also complete orphan stamps whose owner process died (the Apple restart loop "no channel associated with stamp_idx" ran forever, freezing the session and stalling shutdown). |
 | `V212` | `IGScheduler5::isGpuIdle` override from INSTDONE (real TGL never reports idle otherwise). |
-| `xe/csbguard`, `xe/elsqwait`, `xe/nopage` (ported from the XPS project) | CSB event validation panic ("EL[0] was invalidated"), ELSQ write lost right after a context switch, `IGAccelResource::pageon` panic on DPI change. |
+| `xe/csbguard`, `xe/elsqwait`, `xe/sametail`, `xe/poshctx` (from the XPS project) | **Present in the source but NOT active on this machine:** they only route with `-ngreenxefix`, which it does not use. An earlier version of this README wrongly listed them as fixes in use. |
 | **`xe/poolguard`** | **Root cause of the login-screen GPU hang** (two freezes, IPEHR=0xc01dbead): `resolve_ccs` in AppleIntelTGLGraphics asks `IOAccelCommandBufferPool2::getBufferPtrNoInc` for 2 dwords (`movl $2,%esi`) and then writes a 0x224-byte batch, so a batch starting in the last bytes of a 16 KB pool buffer overflows into the next page (GPU executes garbage, CPU corrupts kernel memory). The guard starts a new batch only when at least 4 KB are free in the current buffer. Login screen: 2 h+ clean after, previously ~10 min. |
 | `xe/poolfree` | The diagnostic pool table kept a pointer to a freed pool (one sudden death at process exit). |
 
@@ -91,14 +98,28 @@ kernel log beyond the normal per-second SecurityAgent blit, no GPU reset before 
 testing: deepest idle state of the platform (no Docker VM, no user session), something in the login-screen render path.
 A 1 kHz CPU wake-up keepalive test is prepared.
 
-### 2. Video windows saturate the RCS
+### 2. Any GPU reset leaves the surviving context stuck (main open problem)
+
+Reproducer, no App Store needed: `tools/gva/xe-hang.m` (over-long compute job) plus a video window. One reset takes the render
+engine from 3% to 98-100% busy in the WindowServer context, and the test window from 57 to 37 fps. Contexts created afterwards,
+and a benchmark context that did not go through the reset, keep normal speed. Killing the WindowServer cures it until the next
+reset. In the stuck state 30 of 30 samples show `EXECLIST_STATUS` 0x2098 or 0x12098, HEAD == TAIL (empty ring), IPEHR 0x03800000,
+INSTDONE with only CS not done, two elements in the execlist port, and the driver's CSB head equal to the hardware's.
+
+Ruled out so far: skipping `restoreFromSafeImage`, skipping `affectedByHardwareReset`, FORCE_RESTORE on those contexts (leaves the
+empty ring but hangs at 3DPRIMITIVE, more resets), restoring changed MMIO registers. Clearing the POSH flag in the kernel
+without also clearing `CTX_CTRL` bit 4 froze the machine on reset (2 of 2). Being tested: POSH off done properly, and forcewake plus
+ELSQ waits around the submission. The kext switches for these are `debug.xeng.safeimg`, `noaffected`, `forcerestore`,
+`noposh`, `prepfix`, all at the default (Apple) behaviour unless set.
+
+### 3. Video windows saturate the RCS
 
 With a plain 720p HEVC video in a window (2.8 Mbps, hardware decode, no resets, no dropped frames) a CAMetalLayer test falls
 from 58 to 38 fps: the RCS is busy about 95% of the time with IPEHR at `PIPE_CONTROL`, ACTHD advancing, GT at 900-1100 MHz
 while 1500 MHz is requested (`GT0_PERF_LIMIT_REASONS 0x1381a8` reads `0x21010100`/`0x21012000`). A paused video in the App
 Store keeps the dock animation slow; quitting the app restores it. What the WindowServer submits per frame is not known yet.
 
-### 3. Media batches of the VA plugin hang the RCS
+### 4. Media batches of the VA plugin hang the RCS
 
 See `tools/gva/patch-va-no-videoprocessing.py` for the workaround and what it costs.
 
@@ -151,5 +172,5 @@ OpenCore config is generated by `tools/mk-efi.py` (device properties, kexts, boo
 ## Credits
 
 sgiammori and ChefKiss (NootedGreen), yankedi (HP Dragonfly G2 TGL source and the NOAUX/80EU lineage), JulioNectar
-(XPS 13 Plus Tahoe project: TGL kexts for Tahoe, VA plugin fix, GPUREC/csbguard/elsqwait/nopage origins), fisherlin007
+(XPS 13 Plus Tahoe project: TGL kexts for Tahoe, VA plugin fix, GPUREC origin), fisherlin007
 (real TGL reports on the upstream tracker). License: Thou Shalt Not Profit License 1.0, as upstream.

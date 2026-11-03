@@ -381,12 +381,14 @@ static void wrapChSubmitCommands(void *ch, uint8_t *desc) {
 // lentidão pós-reset vive no WindowServer vivo durante o reset (reiniciá-lo cura; um novo também degrada se passar
 // por outro reset).
 static mach_vm_address_t orgCtxAffected = 0;
+volatile int gXeNoAffected = 0;   // xe/noaffected (03/11): sysctl debug.xeng.noaffected=1 não marca o contexto como afetado pelo reset (experimento)
 static void wrapCtxAffected(void *ctx, bool a, uint32_t b) {
 	static uint32_t n = 0;
 	int pid = proc_selfpid(); char nome[32] = "?"; proc_name(pid, nome, sizeof(nome));
 	auto *c = static_cast<uint8_t *>(ctx);
 	void *task = c ? *reinterpret_cast<void **>(c + 0x18) : nullptr;   // IOAccelContext2+0x18 = IOAccelTask? (só para correlação)
 	if (n++ < 48) IOLog("XeNG RESETDIAG[%u]: affectedByHardwareReset ctx %llx task %llx a=%d b=%u chamador pid %d %s\n", n, (uint64_t)ctx, (uint64_t)task, a, b, pid, nome);
+	if (gXeNoAffected) return;
 	FunctionCast(wrapCtxAffected, orgCtxAffected)(ctx, a, b);
 }
 

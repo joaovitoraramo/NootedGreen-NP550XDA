@@ -546,7 +546,16 @@ static void xeRetryWorker(thread_call_param_t, thread_call_param_t) {
 struct XeSameTailEnt { uint64_t item, ctx, desc, image; uint32_t tail; };
 static XeSameTailEnt gSameTailPrev = {};
 static inline bool xeKptr(uint64_t p) { return (p >> 47) == 0x1ffff; }
+// xe/forcerestore (03/11): contextos que passaram por um reset (lista preenchida em xeBeginReset) recebem FORCE_RESTORE a cada
+// submissão quando `sysctl debug.xeng.forcerestore=1`: experimento contra o RCS parado em 0x2098 com o anel vazio.
+static void *volatile gCtxResetados[8]; static volatile int gForceRestore = 0;
+static volatile uint32_t gForceRestoreN = 0;
 static void xeSameTail(void *that) {
+	if (gForceRestore && that) {
+		auto *st0 = static_cast<uint8_t *>(that); uint32_t bk = *reinterpret_cast<uint32_t *>(st0 + 0x50);
+		if (bk < 2) { uint64_t it = *reinterpret_cast<uint64_t *>(st0 + 0x30 + (1 - bk) * 16); if (xeKptr(it)) { uint64_t cx = *reinterpret_cast<uint64_t *>(it); for (auto &r : gCtxResetados) if ((uint64_t)r == cx) { *reinterpret_cast<uint8_t *>(cx + 0xc9) = 1; gForceRestoreN++; break; } } }
+		return;
+	}
 	static int on = -1;
 	if (on < 0) on = checkKernelArgument("-ngreennosametail") ? 0 : 1;
 	if (on != 1 || !that) return;
@@ -13591,6 +13600,98 @@ static int xePokeSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sy
 	int o = snprintf(s, sizeof(s), "escreva \"reg val\" em hex");
 	return SYSCTL_OUT(req, s, (size_t)o + 1);
 }
+// xe/ringprof (03/11): um vídeo de 720p em janela deixa o RCS ~95% ocupado, mas xe-gpubench mostra que um quadro NV12 de 1080p
+// custa 0,45 ms: há trabalho sobrando. `sysctl debug.xeng.ringprof` amostra o RCS a 1 kHz por 2 s e atribui cada amostra ocupada
+// ao lote em execução (BB_ADDR 0x2140 -> gXeBbs -> processo e anel), mais histograma de contexto (0x2238) e IPEHR, e resume as
+// últimas submissões por processo (quantas, em quanto tempo, quantos dwords).
+static int xeRingProfSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
+	char b[1500]; int o = 0;
+	auto *acc = gXeAccLive; auto *mmio = gXeMmioLive;
+	if (!acc || !mmio) { o = snprintf(b, sizeof(b), "sem acelerador/mmio ainda"); return SYSCTL_OUT(req, b, (size_t)o + 1); }
+	struct Cnt { uint64_t k; uint32_t n; };
+	static Cnt porLote[12], porCtx[8], porIp[8];
+	bzero(porLote, sizeof(porLote)); bzero(porCtx, sizeof(porCtx)); bzero(porIp, sizeof(porIp));
+	auto soma = [](Cnt *t, int m, uint64_t k) { for (int j = 0; j < m; j++) { if (!t[j].n || t[j].k == k) { t[j].k = k; t[j].n++; return; } } };
+	uint32_t ocupado = 0, semLote = 0; const uint32_t N = 2000;
+	Gen11::xeForceWakePub(acc, true, 0b101, 3);
+	for (uint32_t i = 0; i < N; i++) {
+		uint32_t st = xeRecRd(mmio, 0x2234);
+		if (st != 0x18001 && st != 0) {
+			ocupado++;
+			uint64_t bb = xeRecRd(mmio, 0x2140) & ~0xfffULL;
+			soma(porCtx, 8, xeRecRd(mmio, 0x2238)); soma(porIp, 8, xeRecRd(mmio, 0x2068));
+			int melhor = -1; uint64_t dist = ~0ULL;
+			for (int k = 0; k < 128; k++) { auto &e = gXeBbs[k]; if (e.type != 0 || !e.addr) continue; uint64_t a = e.addr & ~0xfffULL; if (a <= bb && bb - a < 0x40000 && bb - a < dist) { dist = bb - a; melhor = k; } }
+			if (melhor >= 0) soma(porLote, 12, ((uint64_t)(uint32_t)gXeBbs[melhor].pid << 8) | (uint8_t)gXeBbs[melhor].sidx); else semLote++;
+		}
+		IODelay(1000);
+	}
+	Gen11::xeForceWakePub(acc, false, 0b101, 3);
+	o += snprintf(b + o, sizeof(b) - (size_t)o, "RCS ocupado %u/%u; sem lote %u; lotes:", ocupado, N, semLote);
+	for (auto &c : porLote) { if (!c.n) break; char nome[20] = "?"; proc_name((int)(c.k >> 8), nome, sizeof(nome)); o += snprintf(b + o, sizeof(b) - (size_t)o, " %s(%d,anel%d)=%u", nome, (int)(c.k >> 8), (int)(int8_t)(c.k & 0xff), c.n); }
+	o += snprintf(b + o, sizeof(b) - (size_t)o, " | ctx:"); for (auto &c : porCtx) { if (!c.n) break; o += snprintf(b + o, sizeof(b) - (size_t)o, " %llx=%u", c.k, c.n); }
+	o += snprintf(b + o, sizeof(b) - (size_t)o, " | ipehr:"); for (auto &c : porIp) { if (!c.n) break; o += snprintf(b + o, sizeof(b) - (size_t)o, " %llx=%u", c.k, c.n); }
+	// últimas submissões ao anel, por processo/tipo de motor
+	static struct { int pid; uint8_t tipo; uint32_t n; uint64_t t0, t1; } sub[12]; bzero(sub, sizeof(sub));
+	for (int k = 0; k < 128; k++) { auto &e = gXeBbs[k]; if (!e.t) continue; for (auto &u : sub) { if (!u.n || (u.pid == e.pid && u.tipo == e.type)) { if (!u.n) { u.pid = e.pid; u.tipo = e.type; u.t0 = u.t1 = e.t; } u.n++; if (e.t < u.t0) u.t0 = e.t; if (e.t > u.t1) u.t1 = e.t; break; } } }
+	o += snprintf(b + o, sizeof(b) - (size_t)o, " | envios:");
+	for (auto &u : sub) { if (!u.n || o > (int)sizeof(b) - 60) break; char nome[20] = "?"; proc_name(u.pid, nome, sizeof(nome)); uint64_t ns = 0; absolutetime_to_nanoseconds(u.t1 - u.t0, &ns); o += snprintf(b + o, sizeof(b) - (size_t)o, " %s(t%u)=%u/%llums", nome, u.tipo, u.n, ns / 1000000ULL); }
+	return SYSCTL_OUT(req, b, (size_t)o + 1);
+}
+// xe/rcsstat (03/11): `sysctl debug.xeng.rcsstat`: onde o RCS passa o tempo dentro do lote (ACTHD - BB_ADDR), que unidades faltam
+// terminar (INSTDONE 0x206c, 0x7100, 0x7104, 0x7108) e o início dos 2 últimos lotes do WindowServer, para comparar antes e depois de um reset.
+static int xeRcsStatSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
+	static char b[9000]; int o = 0;
+	auto *acc = gXeAccLive; auto *mmio = gXeMmioLive;
+	if (!acc || !mmio) { o = snprintf(b, sizeof(b), "sem acelerador/mmio ainda"); return SYSCTL_OUT(req, b, (size_t)o + 1); }
+	struct Cnt { uint32_t k, n; };
+	static Cnt pos[10], id[8], id2[8], id3[8], id4[8]; bzero(pos, sizeof(pos)); bzero(id, sizeof(id)); bzero(id2, sizeof(id2)); bzero(id3, sizeof(id3)); bzero(id4, sizeof(id4));
+	auto soma = [](Cnt *t, int m, uint32_t k) { for (int j = 0; j < m; j++) { if (!t[j].n || t[j].k == k) { t[j].k = k; t[j].n++; return; } } };
+	uint32_t oc = 0; const uint32_t N = 1000;
+	Gen11::xeForceWakePub(acc, true, 0b101, 3);
+	for (uint32_t i = 0; i < N; i++) {
+		uint32_t st = xeRecRd(mmio, 0x2234);
+		if (st != 0x18001 && st != 0) { oc++; soma(pos, 10, xeRecRd(mmio, 0x2074) - (xeRecRd(mmio, 0x2140) & ~1u)); soma(id, 8, xeRecRd(mmio, 0x206c)); soma(id2, 8, xeRecRd(mmio, 0x7100)); soma(id3, 8, xeRecRd(mmio, 0x7104)); soma(id4, 8, xeRecRd(mmio, 0x7108)); }
+		IODelay(1000);
+	}
+	Gen11::xeForceWakePub(acc, false, 0b101, 3);
+	auto lista = [&](const char *nome, Cnt *t, int m) { o += snprintf(b + o, sizeof(b) - (size_t)o, " %s:", nome); for (int j = 0; j < m && t[j].n; j++) o += snprintf(b + o, sizeof(b) - (size_t)o, " %x=%u", t[j].k, t[j].n); o += snprintf(b + o, sizeof(b) - (size_t)o, "\n"); };
+	o += snprintf(b + o, sizeof(b) - (size_t)o, "ocupado %u/%u\n", oc, N);
+	lista("posicao", pos, 10); lista("instdone", id, 8); lista("7100", id2, 8); lista("7104", id3, 8); lista("7108", id4, 8);
+	uint32_t n = gXeBbCN, mostrados = 0;
+	for (uint32_t k = n; k-- > (n > 64 ? n - 64 : 0) && mostrados < 2 && o < (int)sizeof(b) - 2600;) {
+		auto &c = gXeBbCs[k % 64]; char nome[20] = "?"; proc_name(c.pid, nome, sizeof(nome));
+		if (strncmp(nome, "WindowServer", 12)) continue;
+		mostrados++;
+		o += snprintf(b + o, sizeof(b) - (size_t)o, "lote %llx %u dwords copiados:\n", c.addr, c.n);
+		for (uint32_t i = 0; i < c.n; i++) o += snprintf(b + o, sizeof(b) - (size_t)o, "%08x%s", c.dw[i], (i & 7) == 7 ? "\n" : " ");
+		o += snprintf(b + o, sizeof(b) - (size_t)o, "\n");
+	}
+	return SYSCTL_OUT(req, b, (size_t)o + 1);
+}
+static int gXeNoPosh = 0; static uint32_t gXeNoPoshN = 0, gXeCtlAntes = 0;   // xe/noposh
+static int gXePrepFix = 0; static uint32_t gXePrepN = 0, gXePrepEsp30 = 0, gXePrepEspOcioso = 0, gXePrepLimite = 0;   // xe/prepfix
+// xe/csstate2 (03/11): `sysctl debug.xeng.csstate`: estado do escalonador do RCS (portas, banco, cabeça do CSB, flags) lado a lado com
+// o hardware (ELSTAT, CCID, HEAD/TAIL, ponteiro do CSB) e as 12 entradas do CSB, para ver quem espera quem com o anel vazio. Só leitura.
+static int xeCsState2Sysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
+	static char b[4000]; int o = 0;
+	auto *acc = static_cast<uint8_t *>(gXeAccLive); auto *mmio = gXeMmioLive; auto *cs = gCs5Obj[0];
+	if (!acc || !mmio || !cs) { o = snprintf(b, sizeof(b), "sem dados"); return SYSCTL_OUT(req, b, (size_t)o + 1); }
+	Gen11::xeForceWakePub(acc, true, 0b101, 3);
+	uint32_t el = xeRecRd(mmio, 0x2234), el2 = xeRecRd(mmio, 0x2238), h = xeRecRd(mmio, 0x2034), t = xeRecRd(mmio, 0x2030), ptr = xeRecRd(mmio, 0x23a0), cc = xeRecRd(mmio, 0x2180), ip = xeRecRd(mmio, 0x2068), id = xeRecRd(mmio, 0x206c);
+	Gen11::xeForceWakePub(acc, false, 0b101, 3);
+	auto *desc = *reinterpret_cast<uint8_t **>(cs + 0x28); auto *ob = *reinterpret_cast<uint8_t **>(cs + 0x68);
+	o += snprintf(b + o, sizeof(b) - (size_t)o, "force-restore aplicados %u; sem POSH %u, CTX_CTRL da imagem segura %x; prepfix %d envios %u esperas bit30 %u ocioso %u no-limite %u\n", gForceRestoreN, gXeNoPoshN, gXeCtlAntes, gXePrepFix, gXePrepN, gXePrepEsp30, gXePrepEspOcioso, gXePrepLimite);
+	o += snprintf(b + o, sizeof(b) - (size_t)o, "hw: elstat %x/%x head %x tail %x csbptr %x ccid %x ipehr %x instdone %x\n", el, el2, h, t, ptr, cc, ip, id);
+	o += snprintf(b + o, sizeof(b) - (size_t)o, "sw: tipo %u banco %u csbhead %u obj+bc %u flags 1c00=%x 1c38=%x 1c3c=%x\n", desc ? desc[0] : 0xff, *reinterpret_cast<uint32_t *>(cs + 0x50), *reinterpret_cast<uint32_t *>(cs + 0x1c04), ob ? *reinterpret_cast<uint32_t *>(ob + 0xbc) : 0xffffffff, *reinterpret_cast<uint32_t *>(cs + 0x1c00), *reinterpret_cast<uint32_t *>(cs + 0x1c38), *reinterpret_cast<uint32_t *>(cs + 0x1c3c));
+	for (int p = 0; p < 4; p++) { auto *it = *reinterpret_cast<uint8_t **>(cs + 0x30 + p * 8); if (xeKptr((uint64_t)it)) { auto *c = *reinterpret_cast<uint8_t **>(it); uint32_t lrca = xeKptr((uint64_t)c) ? (*reinterpret_cast<uint32_t *>(c + 0x89) & ~0xfffu) : 0; o += snprintf(b + o, sizeof(b) - (size_t)o, "porta[%d] ctx %p lrca %x posh %d it+c %x it+18 %x\n", p, c, lrca, xeKptr((uint64_t)c) ? !!(c[0x6e] & 0x10) : -1, *reinterpret_cast<uint32_t *>(it + 0xc), *reinterpret_cast<uint32_t *>(it + 0x18)); } else o += snprintf(b + o, sizeof(b) - (size_t)o, "porta[%d] vazia\n", p); }
+	auto *base = *reinterpret_cast<uint8_t **>(acc + 0x1240);
+	if (false && base && desc) { o += snprintf(b + o, sizeof(b) - (size_t)o, "csb:"); for (int i = 0; i < 12; i++) { auto *r = base + *reinterpret_cast<uint32_t *>(desc + 0x29) + i * 8; o += snprintf(b + o, sizeof(b) - (size_t)o, " %x:%x", *reinterpret_cast<volatile uint32_t *>(r + 4), *reinterpret_cast<volatile uint32_t *>(r)); } o += snprintf(b + o, sizeof(b) - (size_t)o, "\n"); }
+	return SYSCTL_OUT(req, b, (size_t)o + 1);
+}
+static int gSafeImg = 1;   // xe/ctxdiff
+extern volatile int gXeNoAffected;   // kern_green.cpp
+static int xeCtxDifSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);
 static int xeIrqStatSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);   // xe/irqdiag (definidos mais abaixo)
 static int xeIrqFixSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);
 static int xeStampsSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);
@@ -13601,6 +13702,16 @@ SYSCTL_PROC(_debug_xeng, OID_AUTO, irqstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLA
 SYSCTL_PROC(_debug_xeng, OID_AUTO, irqfix, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, nullptr, 0, xeIrqFixSysctl, "A", "religa a interrupcao do motor na ponte");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, evdump, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, nullptr, 0, xeEvDumpSysctl, "A", "despeja eventos no log; =eval liga EVAL/NTFY");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, stamps, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeStampsSysctl, "A", "stamps com dono");
+SYSCTL_PROC(_debug_xeng, OID_AUTO, ringprof, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRingProfSysctl, "A", "perfil do RCS por processo");
+SYSCTL_PROC(_debug_xeng, OID_AUTO, ctxdiff, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeCtxDifSysctl, "A", "o que o reset muda na imagem do contexto");
+SYSCTL_INT(_debug_xeng, OID_AUTO, safeimg, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, &gSafeImg, 0, "1 = copia a imagem segura no reset (Apple); 0 = mantem a do contexto");
+SYSCTL_PROC(_debug_xeng, OID_AUTO, rcsstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRcsStatSysctl, "A", "onde o RCS passa o tempo e lotes do WindowServer");
+SYSCTL_INT(_debug_xeng, OID_AUTO, noaffected, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, const_cast<int *>(&gXeNoAffected), 0, "1 = nao marca contexto afetado");
+SYSCTL_INT(_debug_xeng, OID_AUTO, forcerestore, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, const_cast<int *>(&gForceRestore), 0, "1 = FORCE_RESTORE nos contextos resetados");
+SYSCTL_PROC(_debug_xeng, OID_AUTO, csstate, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeCsState2Sysctl, "A", "escalonador do RCS x hardware");
+SYSCTL_INT(_debug_xeng, OID_AUTO, noposh, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, &gXeNoPosh, 0, "1 = contextos novos sem POSH");
+SYSCTL_UINT(_debug_xeng, OID_AUTO, noposhn, CTLFLAG_RD | CTLFLAG_LOCKED, &gXeNoPoshN, 0, "contextos com POSH apagado");
+SYSCTL_INT(_debug_xeng, OID_AUTO, prepfix, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, &gXePrepFix, 0, "1 = forcewake e espera na submissao");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, poke, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, nullptr, 0, xePokeSysctl, "A", "escreve registrador: \"reg val\" hex");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, regs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRegsSysctl, "A", "registradores ao vivo");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, ringsample, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRingSampleSysctl, "A", "amostra do que os aneis executam");
@@ -13613,6 +13724,16 @@ static void xeRegsSysctlInstall() {
 	sysctl_register_oid(&sysctl__debug_xeng_ringsample);
 	sysctl_register_oid(&sysctl__debug_xeng_ringregs);
 	sysctl_register_oid(&sysctl__debug_xeng_poke);
+	sysctl_register_oid(&sysctl__debug_xeng_prepfix);
+	sysctl_register_oid(&sysctl__debug_xeng_noposh);
+	sysctl_register_oid(&sysctl__debug_xeng_noposhn);
+	sysctl_register_oid(&sysctl__debug_xeng_csstate);
+	sysctl_register_oid(&sysctl__debug_xeng_noaffected);
+	sysctl_register_oid(&sysctl__debug_xeng_forcerestore);
+	sysctl_register_oid(&sysctl__debug_xeng_rcsstat);
+	sysctl_register_oid(&sysctl__debug_xeng_ctxdiff);
+	sysctl_register_oid(&sysctl__debug_xeng_safeimg);
+	sysctl_register_oid(&sysctl__debug_xeng_ringprof);
 	sysctl_register_oid(&sysctl__debug_xeng_evdump);
 	sysctl_register_oid(&sysctl__debug_xeng_stamps);
 	sysctl_register_oid(&sysctl__debug_xeng_irqstat);
@@ -13961,6 +14082,83 @@ static int xeIrqFixSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct 
 	int o = snprintf(s, sizeof(s), "escreva 1");
 	return SYSCTL_OUT(req, s, (size_t)o + 1);
 }
+// xe/realsubmit (03/11): no TGL real submitExecList não é roteado (xeCs5Submit só existe com -ngreenxefix), logo xeSameTail nunca roda.
+// Gancho mínimo para o FORCE_RESTORE: sem log e sem thread, só o flag antes da submissão original.
+static mach_vm_address_t gOrgRealSubmit = 0;
+static uint64_t xeRealSubmit(void *that, uint32_t x) { xeCsGuarda(that); if (gForceRestore) xeSameTail(that); return FunctionCast(xeRealSubmit, gOrgRealSubmit)(that, x); }
+// xe/prepfix (03/11): as correções de submissão do XPS (xe/elsqwait, forcewake na submissão) só existem com -ngreenxefix, que o TGL real
+// não usa. No estado degradado o EXECLIST_STATUS mostra 0x40002098 (salvamento em andamento) e o RCS fica com o anel vazio: suspeita de
+// escrita perdida na ELSQ. `sysctl debug.xeng.prepfix=1`: forcewake durante a submissão, espera o bit 30 cair (até 2 ms) e, havendo
+// contexto atual, o motor ficar ocioso (até 5 ms). Sem log (pode estar sob spinlock); contadores em csstate.
+static mach_vm_address_t gOrgRealPrep = 0;
+static uint64_t xeRealPrep(void *that, uint32_t a, uint32_t b, const uint32_t *c) {
+	if (!gXePrepFix) return FunctionCast(xeRealPrep, gOrgRealPrep)(that, a, b, c);
+	auto *acc = *reinterpret_cast<void **>(static_cast<uint8_t *>(that) + 0x10);
+	auto *d = *reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(that) + 0x28);
+	if (acc) Gen11::xeForceWakePub(acc, true, 0b101, 3);
+	gXePrepN++;
+	if (d && d[0] == 0 && NGreen::callback) {
+		uint32_t us = 0, st = NGreen::callback->readReg32(0x2234);
+		if (st & 0x40000000) { gXePrepEsp30++; while ((st & 0x40000000) && us < 2000) { IODelay(5); us += 5; st = NGreen::callback->readReg32(0x2234); } }
+		uint32_t hi = NGreen::callback->readReg32(0x2238); us = 0;
+		if (hi && (st & 0xff) != 0x01) { gXePrepEspOcioso++; while ((st & 0xff) != 0x01 && hi && us < 5000) { IODelay(5); us += 5; st = NGreen::callback->readReg32(0x2234); hi = NGreen::callback->readReg32(0x2238); } if (us >= 5000) gXePrepLimite++; }
+	}
+	uint64_t r = FunctionCast(xeRealPrep, gOrgRealPrep)(that, a, b, c);
+	if (acc) Gen11::xeForceWakePub(acc, false, 0b101, 3);
+	return r;
+}
+// xe/ctxdiff (03/11): um único reset deixa o WindowServer lento até morrer, e contextos criados depois ficam rápidos. No reset,
+// IGHardwareContext::beginReset copia a imagem segura por cima da imagem do contexto RCS que estava na porta
+// (restoreFromSafeImage, a mesma cópia de initWithOptions, que depois recebe a inicialização completa). Sem IOLog (caminho de reset):
+// compara a imagem do contexto com a imagem segura e guarda as diferenças, lidas por `sysctl debug.xeng.ctxdiff`.
+// `sysctl -w debug.xeng.safeimg=0` mantém a imagem do contexto no reset (experimento).
+static mach_vm_address_t gOrgBeginReset = 0, gOrgCtxRestoreSafe = 0, gGetVirt = 0;
+static void *volatile gBeginResetCtx = nullptr;
+struct XeCtxDif { uint32_t idx, reg, antes, depois; };
+static XeCtxDif gCtxDif[200]; static uint32_t gCtxDifN = 0, gCtxDifTot = 0, gCtxResets = 0, gCtxPulos = 0; static void *gCtxUlt = nullptr;
+static bool xeCtxRestoreSafe(void *ctx) {
+	if (ctx == gBeginResetCtx && gGetVirt) {
+		auto *c = static_cast<uint8_t *>(ctx); auto *acc = *reinterpret_cast<uint8_t **>(c + 0x50);
+		void *obj = acc ? *reinterpret_cast<void **>(acc + 0x1268) : nullptr; void *mb = *reinterpret_cast<void **>(c + 0x98);
+		if (obj && mb) {
+			auto vt = *reinterpret_cast<uintptr_t **>(obj);
+			auto *src = static_cast<uint32_t *>(reinterpret_cast<void *(*)(void *)>(vt[0x2e0 / 8])(obj));
+			auto *img = static_cast<uint32_t *>(reinterpret_cast<void *(*)(void *)>(gGetVirt)(mb));
+			if (src && img) {
+				uint32_t n = 0, tot = 0;
+				for (uint32_t i = 1; i < 0x6000 / 4; i++) if (img[i] != src[i]) { tot++; if (n < 200) gCtxDif[n++] = {i, img[i - 1], img[i], src[i]}; }
+				gCtxDifN = n; gCtxDifTot = tot; gCtxUlt = ctx; gCtxResets++;
+				if (!gSafeImg) { for (int k = 0; k < 5; k++) img[0x1318 / 4 + k] = 0; gCtxPulos++; return true; }
+			}
+		}
+	}
+	// xe/noposh (03/11): depois de um reset o RCS fica em troca de elemento pendente (0x12098) com o anel vazio e POCS "not done".
+	// Mesmo sintoma do xe/poshctx do XPS (contexto POSH: ctx+0x6e bit 0x10, CTX_CTRL bit 4). `sysctl debug.xeng.noposh=1` apaga a flag
+	// na criação dos contextos seguintes e zera o POSH_LRCA (0x21b0) herdado da imagem segura; vale até reiniciar.
+	auto *cn = static_cast<uint8_t *>(ctx);
+	if (gXeNoPosh && (cn[0x6e] & 0x10)) { cn[0x6e] &= ~0x10; gXeNoPoshN++; }
+	bool rr = FunctionCast(xeCtxRestoreSafe, gOrgCtxRestoreSafe)(ctx);
+	if (gXeNoPosh && rr && !(cn[0x6e] & 0x10) && gGetVirt) {
+		void *smb = *reinterpret_cast<void **>(cn + 0x98);
+		auto *img = smb ? static_cast<volatile uint32_t *>(reinterpret_cast<void *(*)(void *)>(gGetVirt)(smb)) : nullptr;
+		if (img) {
+			volatile uint32_t *pg1 = img + 0x400;
+			// a imagem segura vem de um contexto POSH: além do POSH_LRCA, o CTX_CTRL (mascarado) traz o bit 4 ligado
+			for (int k = 1; k + 1 < 0x100; k++) {
+				if (pg1[k] == 0x21b0) pg1[k + 1] = 0;
+				else if (pg1[k] == 0x2244) { gXeCtlAntes = pg1[k + 1]; pg1[k + 1] = (pg1[k + 1] & ~0x10u) | 0x00100000u; }
+			}
+		}
+	}
+	return rr;
+}
+static bool xeBeginReset(void *ctx) { { bool ja = false; for (auto &r : gCtxResetados) if (r == ctx) ja = true; if (!ja) for (auto &r : gCtxResetados) if (!r) { r = ctx; break; } } gBeginResetCtx = ctx; bool r = FunctionCast(xeBeginReset, gOrgBeginReset)(ctx); gBeginResetCtx = nullptr; return r; }
+static int xeCtxDifSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
+	static char b[9000]; int o = 0;
+	o += snprintf(b + o, sizeof(b) - (size_t)o, "resets-de-contexto %u pulados %u safeimg %d ultimo %p diferencas %u:\n", gCtxResets, gCtxPulos, gSafeImg, gCtxUlt, gCtxDifTot);
+	for (uint32_t i = 0; i < gCtxDifN && o < (int)sizeof(b) - 60; i++) o += snprintf(b + o, sizeof(b) - (size_t)o, "%05x reg %x: %x -> %x\n", gCtxDif[i].idx * 4, gCtxDif[i].reg, gCtxDif[i].antes, gCtxDif[i].depois);
+	return SYSCTL_OUT(req, b, (size_t)o + 1);
+}
 // xe/semdiag (03/11): o RCS passa ~30 ms por quadro em MI_SEMAPHORE_WAIT (poll) nos quadros do WindowServer degradado.
 // Loga as esperas inseridas no anel: índice do anel, índice esperado (widx), valor pedido e o que o stamp esperado já
 // tem (retornado/enviado). Primeiras 24 no boot e 80 nos 120 s após um reset; depois 1 a cada 2048.
@@ -14056,6 +14254,18 @@ static void xeStfInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		bool ok = RouteRequestPlus::routeAll(patcher, index, ri, address, size);
 		if (!ok) patcher.clearError();
 		IOLog("XeNG IRQ: hooks %s\n", ok ? "OK" : "FALHOU");
+	}
+	{
+		gGetVirt = patcher.solveSymbol(index, "__ZNK20IGSharedMappedBuffer17getVirtualAddressEv", address, size); patcher.clearError();
+		RouteRequestPlus rc[] = {   // xe/ctxdiff
+			{"__ZN17IGHardwareContext10beginResetEv", xeBeginReset, gOrgBeginReset},
+			{"__ZN26IGHardwareCommandStreamer514submitExecListEj", xeRealSubmit, gOrgRealSubmit},   // xe/realsubmit
+			{"__ZN26IGHardwareCommandStreamer524prepareExecListAndSubmitEjjPKj", xeRealPrep, gOrgRealPrep},   // xe/prepfix
+			{"__ZN17IGHardwareContext20restoreFromSafeImageEv", xeCtxRestoreSafe, gOrgCtxRestoreSafe},
+		};
+		bool ok = RouteRequestPlus::routeAll(patcher, index, rc, address, size);
+		if (!ok) patcher.clearError();
+		IOLog("XeNG CTXDIFF: hooks %s getVirt %d\n", ok ? "OK" : "FALHOU", gGetVirt != 0);
 	}
 	if (evto && gStfGetStamps && gStfSignal && gStfActive && sig) {
 		RouteRequestPlus r[] = {
