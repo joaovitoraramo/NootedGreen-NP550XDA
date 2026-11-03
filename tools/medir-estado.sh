@@ -1,0 +1,3 @@
+#!/bin/zsh
+# Mede o estado da apresentação: xe-present (fps) com amostra dos anéis durante ele, e a latência do cliente longo.
+${0:A:h}/mac.sh 'cd ~/stress; U() { sudo launchctl asuser 501 sudo -u joaovitor -H /usr/bin/perl -e "alarm 40; exec @ARGV" "$@"; }; (U ./xe-present 400 > /tmp/xp.txt 2>&1 &); /bin/sleep 1.5; echo "aneis durante a apresentacao: $(sysctl -n debug.xeng.ringsample 2>&1)"; /bin/sleep 9; grep -a quadros /tmp/xp.txt | cut -c1-110; echo "aneis em repouso: $(sysctl -n debug.xeng.ringsample 2>&1)"; echo "-- cliente longo (ultimas 6 linhas)"; tail -6 ~/stress/mtllong.log 2>/dev/null'

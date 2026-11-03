@@ -1,0 +1,3 @@
+#!/bin/zsh
+# Lê debug.xeng.regs duas vezes com 1 s de intervalo: taxa real de quadros do painel (frmcount) e estado de PSR/DC/irq.
+${0:A:h}/mac.sh 'a=$(sysctl -n debug.xeng.regs 2>&1); /bin/sleep 1; b=$(sysctl -n debug.xeng.regs 2>&1); fa=$(echo "$a" | grep -oE "frmcount=[0-9a-f]+" | cut -d= -f2); fb=$(echo "$b" | grep -oE "frmcount=[0-9a-f]+" | cut -d= -f2); fla=$(echo "$a" | grep -oE "flipcount=[0-9a-f]+" | cut -d= -f2); flb=$(echo "$b" | grep -oE "flipcount=[0-9a-f]+" | cut -d= -f2); echo "painel: $((0x${fb:-0} - 0x${fa:-0})) quadros/s, flips: $((0x${flb:-0} - 0x${fla:-0}))/s"; echo "$b" | tr " " "\n" | grep -vE "^(frmcount|flipcount)=" | tr "\n" " "; echo'
