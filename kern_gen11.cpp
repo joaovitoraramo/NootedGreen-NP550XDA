@@ -13332,6 +13332,7 @@ static volatile uint32_t gXeFlushN = 0;
 static int gXeFlushOn = -1;
 static void xeStampScan(void *acc);   // xe/stampdump (definida junto do STAMPFIX)
 static uint64_t gRecLastResetT = 0;
+static void *volatile gXeAccLive = nullptr; static volatile uint8_t *volatile gXeMmioLive = nullptr;   // xe/ringsample
 struct XeBb { void *ring; uint64_t addr; uint32_t seq, hdr; int pid; uint8_t type; int8_t sidx; uint8_t flushed; uint64_t t; void *caller; };
 static XeBb gXeBbs[128];
 static volatile uint32_t gXeBbN = 0;
@@ -13355,6 +13356,7 @@ static uint64_t xeRecSubmitBatchBuffer(void *ring, uint64_t addr, uint32_t seq, 
 	e.sidx = r ? (int8_t)*reinterpret_cast<int *>(r + 0x38) : -1; e.t = mach_absolute_time(); e.caller = __builtin_return_address(0);
 	e.flushed = 0;
 	if (hdr && r && r[0x40] == 0) xeBbCopy(addr, hdr);
+	if (r) { gXeAccLive = *reinterpret_cast<void **>(r + 0x10); gXeMmioLive = *reinterpret_cast<volatile uint8_t **>(r + 0x50); }
 	if (gRecLastResetT && gRecAbs3s) {   // xe/stampdump: a cada 5 s nos 90 s seguintes a um reset, lista stamps atrasados
 		static uint64_t last = 0;
 		uint64_t now = mach_absolute_time();
@@ -13483,15 +13485,46 @@ static int xeRegsSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sy
 	}
 	return SYSCTL_OUT(req, b, (size_t)o + 1);
 }
+// xe/ringsample: `sysctl debug.xeng.ringsample` amostra por 2 s (10 ms) o que o RCS e o BCS estão executando (IPEHR,
+// ACTHD, HEAD/TAIL, EXECLIST_STATUS) com forcewake, e resume: quantas amostras ocupadas, os IPEHR mais vistos e quantos
+// ACTHD distintos (ACTHD repetido com anel ocupado = travado numa espera).
+static int xeRingSampleSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
+	char b[900]; int o = 0;
+	auto *acc = gXeAccLive; auto *mmio = gXeMmioLive;
+	if (!acc || !mmio) { o = snprintf(b, sizeof(b), "sem acelerador/mmio ainda"); return SYSCTL_OUT(req, b, (size_t)o + 1); }
+	Gen11::xeForceWakePub(acc, true, 0b101, 3);
+	const uint32_t bases[2] = {0x2000, 0x22000}; const char *nomes[2] = {"RCS", "BCS"};
+	for (int e = 0; e < 2; e++) {
+		uint32_t ip[8] = {0}, ipn[8] = {0}, ocup = 0, acthdDist = 0, lastAct = 0xffffffff, mesmoAct = 0; uint32_t bs = bases[e];
+		for (int k = 0; k < 200; k++) {
+			uint32_t st = xeRecRd(mmio, bs + 0x234), ipehr = xeRecRd(mmio, bs + 0x68), acthd = xeRecRd(mmio, bs + 0x74);
+			bool busy = (st & 0x1) || ((st >> 15) & 1) || ((st >> 16) & 1);
+			if (busy) {
+				ocup++;
+				int j; for (j = 0; j < 8; j++) { if (ipn[j] == 0 || ip[j] == ipehr) { ip[j] = ipehr; ipn[j]++; break; } }
+				if (acthd == lastAct) mesmoAct++; else acthdDist++;
+				lastAct = acthd;
+			}
+			IODelay(10000);
+		}
+		o += snprintf(b + o, sizeof(b) - (size_t)o, "%s: ocupado %u/200 acthd-distintos %u acthd-repetido %u ipehr:", nomes[e], ocup, acthdDist, mesmoAct);
+		for (int j = 0; j < 8 && ipn[j]; j++) o += snprintf(b + o, sizeof(b) - (size_t)o, " %08x*%u", ip[j], ipn[j]);
+		o += snprintf(b + o, sizeof(b) - (size_t)o, " elstat=%08x; ", xeRecRd(mmio, bs + 0x234));
+	}
+	Gen11::xeForceWakePub(acc, false, 0b101, 3);
+	return SYSCTL_OUT(req, b, (size_t)o + 1);
+}
 SYSCTL_DECL(_debug);
 SYSCTL_NODE(_debug, OID_AUTO, xeng, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "NootedGreen NP550");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, regs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRegsSysctl, "A", "registradores ao vivo");
+SYSCTL_PROC(_debug_xeng, OID_AUTO, ringsample, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRingSampleSysctl, "A", "amostra do que os aneis executam");
 static void xeRegsSysctlInstall() {
 	static bool feito = false;
 	if (feito) return;
 	feito = true;
 	sysctl_register_oid(&sysctl__debug_xeng);
 	sysctl_register_oid(&sysctl__debug_xeng_regs);
+	sysctl_register_oid(&sysctl__debug_xeng_ringsample);
 	IOLog("XeNG REGSYSCTL: debug.xeng.regs registrado\n");
 }
 // xe/regdiff: compara registradores da GT antes e depois de um reset do RCS, e entre resets. Depois dos resets com vídeo o
