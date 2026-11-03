@@ -13513,8 +13513,57 @@ static int xeRingSampleSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, str
 	Gen11::xeForceWakePub(acc, false, 0b101, 3);
 	return SYSCTL_OUT(req, b, (size_t)o + 1);
 }
+// xe/ringregs (03/11): `sysctl debug.xeng.ringregs` despeja, com forcewake, os registradores não nulos do RCS (0x2000),
+// BCS (0x22000), CCS (0x1a000) e do bloco de interrupções da GT (0x190000) para comparar limpo x degradado x curado.
+static int xeRingRegsSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
+	char b[256]; int o = 0, err = 0;
+	auto *acc = gXeAccLive; auto *mmio = gXeMmioLive;
+	if (!acc || !mmio) { o = snprintf(b, sizeof(b), "sem acelerador/mmio ainda"); return SYSCTL_OUT(req, b, (size_t)o + 1); }
+	static const struct { uint32_t ini, fim; } fx[] = {{0x2000, 0x2300}, {0x22000, 0x22300}, {0x1a000, 0x1a300}, {0x190000, 0x1900f0}};
+	Gen11::xeForceWakePub(acc, true, 0b101, 3);
+	for (auto &f : fx) {
+		for (uint32_t r = f.ini; r < f.fim && !err; r += 4) {
+			uint32_t v = xeRecRd(mmio, r);
+			if (!v) continue;
+			o += snprintf(b + o, sizeof(b) - (size_t)o, "%x=%x ", r, v);
+			if (o > 200) { err = SYSCTL_OUT(req, b, (size_t)o); o = 0; }
+		}
+	}
+	Gen11::xeForceWakePub(acc, false, 0b101, 3);
+	if (!err) err = SYSCTL_OUT(req, b, (size_t)o + 1);
+	return err;
+}
+// xe/poke (03/11): `sysctl -w debug.xeng.poke="224c 1"` escreve um registrador (hex) com forcewake e loga o antes/depois.
+static int xePokeSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
+	char s[64] = {0}; int err;
+	if (req->newptr) {
+		size_t n = req->newlen < sizeof(s) - 1 ? req->newlen : sizeof(s) - 1;
+		err = SYSCTL_IN(req, s, n); if (err) return err;
+		s[n] = 0;
+		uint32_t reg = 0, val = 0; int campo = 0; bool algum = false;
+		for (char *c = s; *c; c++) {
+			int d = (*c >= '0' && *c <= '9') ? *c - '0' : (*c >= 'a' && *c <= 'f') ? *c - 'a' + 10 : (*c >= 'A' && *c <= 'F') ? *c - 'A' + 10 : -1;
+			if (d < 0) { if (algum) { campo++; algum = false; } continue; }
+			algum = true;
+			if (campo == 0) reg = (reg << 4) | (uint32_t)d; else if (campo == 1) val = (val << 4) | (uint32_t)d;
+		}
+		auto *acc = gXeAccLive; auto *mmio = gXeMmioLive;
+		if (!acc || !mmio || reg >= 0x200000 || (reg & 3)) { IOLog("XeNG POKE: recusado '%s'\n", s); return EINVAL; }
+		Gen11::xeForceWakePub(acc, true, 0b101, 3);
+		uint32_t antes = xeRecRd(mmio, reg);
+		xeRecWr(mmio, reg, val);
+		uint32_t depois = xeRecRd(mmio, reg);
+		Gen11::xeForceWakePub(acc, false, 0b101, 3);
+		IOLog("XeNG POKE: reg %x: %x -> escrito %x, lido %x\n", reg, antes, val, depois);
+		return 0;
+	}
+	int o = snprintf(s, sizeof(s), "escreva \"reg val\" em hex");
+	return SYSCTL_OUT(req, s, (size_t)o + 1);
+}
 SYSCTL_DECL(_debug);
 SYSCTL_NODE(_debug, OID_AUTO, xeng, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "NootedGreen NP550");
+SYSCTL_PROC(_debug_xeng, OID_AUTO, ringregs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRingRegsSysctl, "A", "registradores dos aneis com forcewake");
+SYSCTL_PROC(_debug_xeng, OID_AUTO, poke, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, nullptr, 0, xePokeSysctl, "A", "escreve registrador: \"reg val\" hex");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, regs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRegsSysctl, "A", "registradores ao vivo");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, ringsample, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRingSampleSysctl, "A", "amostra do que os aneis executam");
 static void xeRegsSysctlInstall() {
@@ -13524,12 +13573,14 @@ static void xeRegsSysctlInstall() {
 	sysctl_register_oid(&sysctl__debug_xeng);
 	sysctl_register_oid(&sysctl__debug_xeng_regs);
 	sysctl_register_oid(&sysctl__debug_xeng_ringsample);
+	sysctl_register_oid(&sysctl__debug_xeng_ringregs);
+	sysctl_register_oid(&sysctl__debug_xeng_poke);
 	IOLog("XeNG REGSYSCTL: debug.xeng.regs registrado\n");
 }
 // xe/regdiff: compara registradores da GT antes e depois de um reset do RCS, e entre resets. Depois dos resets com vídeo o
 // WindowServer atualiza a tela 13x menos sem bloquear na GPU (ws-medir.sh): procura o que o reset deixa diferente.
 static const struct { uint32_t ini, fim; } kXeRegFx[] = {
-	{0x2080, 0x2090}, {0x209c, 0x20b0}, {0x20c0, 0x2110}, {0x2220, 0x2240}, {0x2290, 0x22a0},
+	{0x2000, 0x2300}, {0x22000, 0x22300}, {0x1a000, 0x1a300},   // xe/ringregs (03/11): anéis RCS/BCS/CCS inteiros (inclui SEMA_WAIT_POLL +0x24c)
 	{0x7000, 0x7400}, {0x9400, 0x9440}, {0x94d0, 0x94f0}, {0xa000, 0xa100}, {0xb100, 0xb200},
 	{0xe100, 0xe200}, {0xe400, 0xe500}, {0x190000, 0x1900f0}, {0x44400, 0x44420}, {0x44200, 0x44210},
 	{0x60800, 0x60810}, {0x60840, 0x60844}, {0x60900, 0x60910}, {0x60940, 0x60944}, {0x45504, 0x45508}, {0x70008, 0x7000c}, {0x70180, 0x70184},  // PSR/DC/pipe
@@ -13783,8 +13834,9 @@ static uint64_t xeSemPollDiag(void *ring, uint32_t value, int widx) {
 		auto *st = task ? reinterpret_cast<volatile uint32_t *>(reinterpret_cast<void *(*)(void *)>(gStfGetStamps)(task)) : nullptr;
 		if (st) { ret = st[(uint32_t)widx * 16]; sub = st[(uint32_t)widx * 16 + 2]; }
 	}
-	IOLog("XeNG SEMWAIT[%u]: anel idx %d tipo %u espera stamp %d >= 0x%x (retornado 0x%x enviado 0x%x)%s ret=%llu\n", n, rb ? *reinterpret_cast<int *>(rb + 0x38) : -1,
-	      rb ? rb[0x40] : 0xff, widx, value, ret, sub, (int32_t)(value - ret) > 0 ? " PENDENTE" : "", r);
+	char nome[32] = {0}; int pid = proc_selfpid(); proc_name(pid, nome, sizeof(nome));
+	IOLog("XeNG SEMWAIT[%u]: anel idx %d tipo %u espera stamp %d >= 0x%x (retornado 0x%x enviado 0x%x)%s ret=%llu pid %d %s\n", n, rb ? *reinterpret_cast<int *>(rb + 0x38) : -1,
+	      rb ? rb[0x40] : 0xff, widx, value, ret, sub, (int32_t)(value - ret) > 0 ? " PENDENTE" : "", r, pid, nome);
 	return r;
 }
 static uint32_t gStampPrevRet[64], gStampPrevSub[64], gDispFixN = 0;
