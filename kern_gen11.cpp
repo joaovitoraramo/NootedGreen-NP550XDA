@@ -13683,6 +13683,25 @@ static void *xeStfEventTimeout(void *em, int idx) {
 // latência Metal normal: suspeita de stamp de DISPLAY (índices acc+0x11a0..0x11a4, que o STAMPFIX pula) perdido no
 // reset -> cada flip espera timeout. Lista os stamps atrasados; com -ngreendispstampfix, um stamp de display parado em
 // duas varreduras seguidas (10 s) é dado como concluído (retornado = enviado) e os que esperam são avisados.
+// xe/stampirq (02/11 23:55): depois dos resets a tela fica a 21 fps (46 ms/quadro, máx 100 ms) com GPU ociosa, flips por
+// interrupção e stamps em dia: suspeita de o bit de interrupção do stamp do WindowServer (máscara em em+0xd40, contagens
+// em+0xd80/+0xd90) ficar desligado depois do restart, deixando as esperas dele só com o timer periódico.
+static void *gXeEm = nullptr;
+static mach_vm_address_t gOrgEnStampIrq = 0, gOrgDisStampIrq = 0;
+static uint32_t gStampIrqLogN = 0;
+static bool xeStampIrqJanela() { return gRecLastResetT && gRecAbs3s && mach_absolute_time() - gRecLastResetT < gRecAbs3s * 30; }
+static void xeEnStampIrq(void *em, int idx, int flag) {
+	gXeEm = em;
+	FunctionCast(xeEnStampIrq, gOrgEnStampIrq)(em, idx, flag);
+	if (xeStampIrqJanela() && gStampIrqLogN++ < 60) IOLog("XeNG STAMPIRQ: enable idx %d flag %d -> mascara %llx n=%llu soft=%llu\n", idx, flag,
+		*reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(em) + 0xd40), *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(em) + 0xd80), *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(em) + 0xd90));
+}
+static void xeDisStampIrq(void *em, int idx, int flag) {
+	gXeEm = em;
+	FunctionCast(xeDisStampIrq, gOrgDisStampIrq)(em, idx, flag);
+	if (xeStampIrqJanela() && gStampIrqLogN++ < 60) IOLog("XeNG STAMPIRQ: disable idx %d flag %d -> mascara %llx n=%llu soft=%llu\n", idx, flag,
+		*reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(em) + 0xd40), *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(em) + 0xd80), *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(em) + 0xd90));
+}
 static uint32_t gStampPrevRet[64], gStampPrevSub[64], gDispFixN = 0;
 static void xeStampScan(void *accv) {
 	auto *acc = static_cast<uint8_t *>(accv);
@@ -13704,7 +13723,9 @@ static void xeStampScan(void *accv) {
 		gStampPrevSub[idx] = sub; gStampPrevRet[idx] = ret;
 	}
 	if (bits && gStfSignal) reinterpret_cast<void (*)(void *, const uint64_t *)>(gStfSignal)(acc, &bits);
-	IOLog("XeNG STAMPS: %u atrasados (display %d..%d)\n", n, d0, d1);
+	if (gXeEm) IOLog("XeNG STAMPS: %u atrasados (display %d..%d) mascara-irq %llx n=%llu soft=%llu\n", n, d0, d1,
+		*reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(gXeEm) + 0xd40), *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(gXeEm) + 0xd80), *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(gXeEm) + 0xd90));
+	else IOLog("XeNG STAMPS: %u atrasados (display %d..%d)\n", n, d0, d1);
 }
 
 static void xeStfInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -13723,6 +13744,15 @@ static void xeStfInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			gStfLut = f + 0x4c + *reinterpret_cast<const int32_t *>(f + 0x48);
 			sig = true;
 		}
+	}
+	{
+		RouteRequestPlus ri[] = {
+			{"__ZN19IGAccelEventMachine20enableStampInterruptEii", xeEnStampIrq, gOrgEnStampIrq},
+			{"__ZN19IGAccelEventMachine21disableStampInterruptEii", xeDisStampIrq, gOrgDisStampIrq},
+		};
+		bool ok = RouteRequestPlus::routeAll(patcher, index, ri, address, size);
+		if (!ok) patcher.clearError();
+		IOLog("XeNG STAMPIRQ: hooks %s\n", ok ? "OK" : "FALHOU");
 	}
 	if (evto && gStfGetStamps && gStfSignal && gStfActive && sig) {
 		RouteRequestPlus r[] = {
