@@ -457,8 +457,10 @@ static uint64_t xeS5Push(void *that, void *ctx, uint32_t a, uint32_t b, bool c, 
 	xeEv('PUSH', n, a, b);
 	return r;
 }
+static volatile int gEvTraceEval2 = 0;
 static uint64_t xeS5Notify(void *that, int cs) {
 	++gS5NotifyN;
+	if (gEvTraceEval2) xeEv('NTFY', (uint32_t)cs, gS5NotifyN, 0);
 	return FunctionCast(xeS5Notify, gOrgS5Notify)(that, cs);
 }
 // xe/csstate (19/10): estado interno dos command streamers 5 e do DPSM, a cada 2 s (thread_call), para ver por que
@@ -852,10 +854,11 @@ static void xeCsbElSwitch(void *that, const uint32_t *e) {
 	if (xeCsbEventoInvalido(that, e, true, 'CSBS')) return;
 	FunctionCast(xeCsbElSwitch, gOrgCsbElSwitch)(that, e);
 }
+static volatile int gEvTraceEval = 0;   // xe/evdump (03/11): sysctl -w debug.xeng.evdump=eval liga o registro de EVAL/NTFY
 static uint64_t xeEvalWait(void *that, const bool *thr, bool x, bool y) {
 	uint64_t r = FunctionCast(xeEvalWait, gOrgEvalWait)(that, thr, x, y);
 	auto *cs = static_cast<uint8_t *>(that);
-	(void)cs; (void)thr; (void)x; (void)y;  // 19/10: EVAL não é mais registrado (tempestade enchia o buffer)
+	if (gEvTraceEval) xeEv('EVAL', (uint32_t)(uintptr_t)cs & 0xfff0, (thr && *thr) | (x << 1) | (y << 2), (uint32_t)r);
 	return r;
 }
 static uint64_t xeVerifyThr(void *that, bool *out) {
@@ -13349,6 +13352,7 @@ static void xeBbCopy(uint64_t addr, const uint32_t *hdr) {
 	c.addr = addr; c.pid = proc_selfpid(); c.n = n;
 	for (uint32_t i = 0; i < n; i++) c.dw[i] = hdr[i];
 }
+static int gStampOwnerPid[64]; static int8_t gStampOwnerRing[64]; static uint64_t gStampOwnerT[64];   // xe/stampowner
 static uint64_t xeRecSubmitBatchBuffer(void *ring, uint64_t addr, uint32_t seq, uint32_t *hdr, uint32_t flags, bool b1, bool b2) {
 	auto *r = static_cast<uint8_t *>(ring);
 	auto &e = gXeBbs[gXeBbN++ % 128];
@@ -13357,6 +13361,10 @@ static uint64_t xeRecSubmitBatchBuffer(void *ring, uint64_t addr, uint32_t seq, 
 	e.flushed = 0;
 	if (hdr && r && r[0x40] == 0) xeBbCopy(addr, hdr);
 	if (r) { gXeAccLive = *reinterpret_cast<void **>(r + 0x10); gXeMmioLive = *reinterpret_cast<volatile uint8_t **>(r + 0x50); }
+	if (r) {   // xe/stampowner (03/11): quem submete em cada índice de stamp (ring+0x20 = índice, cf. processGPUReset)
+		int si = *reinterpret_cast<int *>(r + 0x20);
+		if (si >= 0 && si < 64) { gStampOwnerPid[si] = e.pid; gStampOwnerRing[si] = e.sidx; gStampOwnerT[si] = e.t; }
+	}
 	if (gRecLastResetT && gRecAbs3s) {   // xe/stampdump: a cada 5 s nos 90 s seguintes a um reset, lista stamps atrasados
 		static uint64_t last = 0;
 		uint64_t now = mach_absolute_time();
@@ -13533,6 +13541,20 @@ static int xeRingRegsSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struc
 	if (!err) err = SYSCTL_OUT(req, b, (size_t)o + 1);
 	return err;
 }
+// xe/evdump (03/11): `sysctl debug.xeng.evdump` despeja no log do kernel os últimos 300 eventos (EXEC/SUBM/FSUB/EVAL/NTFY…)
+// e 40 entradas de CSB (xeEvDumpRecent); `sysctl -w debug.xeng.evdump=eval` liga/desliga o registro de EVAL e NTFY.
+static int xeEvDumpSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
+	char s[32] = {0};
+	if (req->newptr) {
+		size_t n = req->newlen < sizeof(s) - 1 ? req->newlen : sizeof(s) - 1;
+		int err = SYSCTL_IN(req, s, n); if (err) return err;
+		if (s[0] == 'e') { gEvTraceEval = !gEvTraceEval; gEvTraceEval2 = gEvTraceEval; IOLog("XeNG EVDUMP: registro EVAL/NTFY %s\n", gEvTraceEval ? "ligado" : "desligado"); }
+		else { static int seq = 10; xeEvDumpRecent(300, ++seq); }
+		return 0;
+	}
+	int o = snprintf(s, sizeof(s), "eventos=%u eval=%d", gEvN, gEvTraceEval);
+	return SYSCTL_OUT(req, s, (size_t)o + 1);
+}
 // xe/poke (03/11): `sysctl -w debug.xeng.poke="224c 1"` escreve um registrador (hex) com forcewake e loga o antes/depois.
 static int xePokeSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
 	char s[64] = {0}; int err;
@@ -13562,11 +13584,14 @@ static int xePokeSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sy
 }
 static int xeIrqStatSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);   // xe/irqdiag (definidos mais abaixo)
 static int xeIrqFixSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);
+static int xeStampsSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);
 SYSCTL_DECL(_debug);
 SYSCTL_NODE(_debug, OID_AUTO, xeng, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "NootedGreen NP550");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, ringregs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRingRegsSysctl, "A", "registradores dos aneis com forcewake");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, irqstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeIrqStatSysctl, "A", "contadores de interrupcao e mascaras dos CS");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, irqfix, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, nullptr, 0, xeIrqFixSysctl, "A", "religa a interrupcao do motor na ponte");
+SYSCTL_PROC(_debug_xeng, OID_AUTO, evdump, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, nullptr, 0, xeEvDumpSysctl, "A", "despeja eventos no log; =eval liga EVAL/NTFY");
+SYSCTL_PROC(_debug_xeng, OID_AUTO, stamps, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeStampsSysctl, "A", "stamps com dono");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, poke, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, nullptr, 0, xePokeSysctl, "A", "escreve registrador: \"reg val\" hex");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, regs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRegsSysctl, "A", "registradores ao vivo");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, ringsample, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRingSampleSysctl, "A", "amostra do que os aneis executam");
@@ -13579,6 +13604,8 @@ static void xeRegsSysctlInstall() {
 	sysctl_register_oid(&sysctl__debug_xeng_ringsample);
 	sysctl_register_oid(&sysctl__debug_xeng_ringregs);
 	sysctl_register_oid(&sysctl__debug_xeng_poke);
+	sysctl_register_oid(&sysctl__debug_xeng_evdump);
+	sysctl_register_oid(&sysctl__debug_xeng_stamps);
 	sysctl_register_oid(&sysctl__debug_xeng_irqstat);
 	sysctl_register_oid(&sysctl__debug_xeng_irqfix);
 	IOLog("XeNG REGSYSCTL: debug.xeng.regs registrado\n");
@@ -13853,6 +13880,23 @@ static uint64_t xeIbDisable(void *that, uint32_t tipo) { gIbDisableN++; xeIrqEv(
 static void xeIbEnables(void *that) { gIbEnablesN++; xeIrqEv('e', 0, __builtin_return_address(0)); FunctionCast(xeIbEnables, gOrgIbEnables)(that); }
 static void xeIbDisables(void *that) { gIbDisablesN++; xeIrqEv('d', 0, __builtin_return_address(0)); FunctionCast(xeIbDisables, gOrgIbDisables)(that); }
 static void xeIbClear(void *that) { gIbClearN++; xeIrqEv('c', 0, __builtin_return_address(0)); FunctionCast(xeIbClear, gOrgIbClear)(that); }
+// xe/stamps (03/11): `sysctl debug.xeng.stamps` lista os 64 stamps (enviado/retornado) com o último processo que submeteu.
+static int xeStampsSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
+	char b[2400]; int o = 0;
+	auto *acc = static_cast<uint8_t *>(gXeAccLive);
+	auto *task = acc && gStfGetStamps ? *reinterpret_cast<void **>(acc + 0x150) : nullptr;
+	auto *st = task ? reinterpret_cast<volatile uint32_t *>(reinterpret_cast<void *(*)(void *)>(gStfGetStamps)(task)) : nullptr;
+	if (!st) { o = snprintf(b, sizeof(b), "sem stamps"); return SYSCTL_OUT(req, b, (size_t)o + 1); }
+	uint64_t agora = mach_absolute_time();
+	for (int i = 0; i < 64 && o < (int)sizeof(b) - 80; i++) {
+		uint32_t ret = st[i * 16], sub = st[i * 16 + 2];
+		if (!ret && !sub && !gStampOwnerPid[i]) continue;
+		char nome[20] = "?"; if (gStampOwnerPid[i]) proc_name(gStampOwnerPid[i], nome, sizeof(nome));
+		uint64_t ns = 0; if (gStampOwnerT[i]) absolutetime_to_nanoseconds(agora - gStampOwnerT[i], &ns);
+		o += snprintf(b + o, sizeof(b) - (size_t)o, "%d:%x/%x%s %d %s anel%d %llus; ", i, sub, ret, (int32_t)(sub - ret) > 0 ? " PEND" : "", gStampOwnerPid[i], nome, gStampOwnerRing[i], ns / 1000000000ULL);
+	}
+	return SYSCTL_OUT(req, b, (size_t)o + 1);
+}
 static int xeIrqStatSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
 	char b[1400]; int o = 0;
 	o += snprintf(b + o, sizeof(b) - (size_t)o, "filtro=%u handler=%u emstamp=%u flushhw=%u flush2=%u csen=%u csdis=%u enable=%u disable=%u enables=%u disables=%u clear=%u |", gIbFilterN, gIbHandlerN, gEmStampN, gCsFlushHwN, gCsFlush2N, gCsEnStampN, gCsDisStampN, gIbEnableN, gIbDisableN, gIbEnablesN, gIbDisablesN, gIbClearN);
