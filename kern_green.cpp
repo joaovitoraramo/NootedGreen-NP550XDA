@@ -377,6 +377,19 @@ static void wrapChSubmitCommands(void *ch, uint8_t *desc) {
 	      (uint64_t)*reinterpret_cast<void **>(desc + 0x10), (uint64_t)ch, pid, nome);
 }
 
+// xe/resetdiag (03/11): quem o IOAF marca como afetado por um reset (IOAccelContext2::affectedByHardwareReset) — a
+// lentidão pós-reset vive no WindowServer vivo durante o reset (reiniciá-lo cura; um novo também degrada se passar
+// por outro reset).
+static mach_vm_address_t orgCtxAffected = 0;
+static void wrapCtxAffected(void *ctx, bool a, uint32_t b) {
+	static uint32_t n = 0;
+	int pid = proc_selfpid(); char nome[32] = "?"; proc_name(pid, nome, sizeof(nome));
+	auto *c = static_cast<uint8_t *>(ctx);
+	void *task = c ? *reinterpret_cast<void **>(c + 0x18) : nullptr;   // IOAccelContext2+0x18 = IOAccelTask? (só para correlação)
+	if (n++ < 48) IOLog("XeNG RESETDIAG[%u]: affectedByHardwareReset ctx %llx task %llx a=%d b=%u chamador pid %d %s\n", n, (uint64_t)ctx, (uint64_t)task, a, b, pid, nome);
+	FunctionCast(wrapCtxAffected, orgCtxAffected)(ctx, a, b);
+}
+
 struct XeSub { void *pool; uint64_t gpu, cpu; uint32_t ndw; int16_t idx; uint64_t t; };
 static XeSub gXeSubs[64];
 static volatile uint32_t gXeSubN = 0;
@@ -751,6 +764,7 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		// commands on floor") e o desktop fica lento até o reboot. Diz de quem é o contexto descartado.
 		RouteRequestPlus dropRequest[] = {
 			{"__ZN19IOAccelFIFOChannel214submitCommandsEP24IOAccelCommandDescriptor", wrapChSubmitCommands, orgChSubmitCommands},
+			{"__ZN15IOAccelContext223affectedByHardwareResetEbj", wrapCtxAffected, orgCtxAffected},  // xe/resetdiag
 		};
 		if (!RouteRequestPlus::routeAll(patcher, index, dropRequest, address, size)) { patcher.clearError(); IOLog("XeNG DROPDIAG: hook FALHOU\n"); }
 		else IOLog("XeNG DROPDIAG: hook submitCommands OK\n");
