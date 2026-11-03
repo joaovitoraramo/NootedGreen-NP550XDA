@@ -13473,6 +13473,30 @@ static uint32_t xeRegLe(volatile uint8_t *mmio, uint32_t *out) {
 	for (auto &f : kXeRegFx) for (uint32_t r = f.ini; r < f.fim && n < kXeRegMax; r += 4) out[n++] = xeRecRd(mmio, r);
 	return n;
 }
+// xe/regrestore (02/11 23h): o reset do RCS zera workarounds de contexto que ninguém reaplica (0xe48c ROW_CHICKEN4 perde o
+// bit 9 = DISABLE_TDL_PUSH, Wa_14010229206 do TGL; 0xb104 perde o bit 24; 0xe424 perde o bit 0). Depois disso o
+// WindowServer passa a atualizar a tela 13x menos (ws-medir.sh) até o reboot. Devolve o valor de antes do 1º reset.
+// -ngreennoregrestore desliga.
+static const struct { uint32_t reg; bool masked; } kXeRegRest[] = {{0xe48c, true}, {0xb104, false}, {0xe424, false}};
+static bool xeRegBaseVal(uint32_t reg, uint32_t *val) {
+	uint32_t n = 0;
+	for (auto &f : kXeRegFx) for (uint32_t r = f.ini; r < f.fim && n < kXeRegMax; r += 4, n++) if (r == reg) { *val = gXeRegBase[n]; return true; }
+	return false;
+}
+static uint32_t gXeRegRestN = 0;
+static void xeRegRestaura(volatile uint8_t *mmio) {
+	static int on = -1;
+	if (on < 0) on = checkKernelArgument("-ngreennoregrestore") ? 0 : 1;
+	if (on != 1 || !gXeRegBaseOk) return;
+	for (auto &e : kXeRegRest) {
+		uint32_t base, cur = xeRecRd(mmio, e.reg);
+		if (!xeRegBaseVal(e.reg, &base)) continue;
+		if (e.masked ? ((cur & 0xffff) == (base & 0xffff)) : (cur == base)) continue;
+		xeRecWr(mmio, e.reg, e.masked ? (0xffff0000u | (base & 0xffff)) : base);
+		uint32_t dep = xeRecRd(mmio, e.reg);
+		if (gXeRegRestN++ < 16) IOLog("XeNG REGRESTORE: %06x %08x -> %08x (base %08x)\n", e.reg, cur, dep, base);
+	}
+}
 static void xeRegCompara(const char *rot, const uint32_t *a, volatile uint8_t *mmio, uint32_t lim) {
 	uint32_t n = 0, dif = 0;
 	for (auto &f : kXeRegFx) for (uint32_t r = f.ini; r < f.fim && n < kXeRegMax; r += 4, n++) {
@@ -13571,6 +13595,7 @@ static bool xeRecResetGraphicsEngine(void *ring, void *ctx) {
 	}
 	if (exDid) did |= 8;
 	if (regDiff) { xeRegCompara("antes-depois", gXeRegAntes, mmio, 64); nRegDiff++; }
+	if (own == 0) xeRegRestaura(mmio);
 	sfw(acc, false, 7);
 	gRecLast = (uint32_t)own | ((uint32_t)ret << 4) | ((uint32_t)kick << 5) | (did << 8) | ((snap[0] >> 12) << 12);
 	xeEv('GREC', gRecLast, snap[0], sibHws);
@@ -13613,22 +13638,24 @@ static void *xeStfEventTimeout(void *em, int idx) {
 		if (ch) gStfN = 0;
 		return ch;
 	}
+	static uint32_t nDecl = 0;
+#define XE_STF_DECL(motivo, ...) do { if (nDecl++ < 24) IOLog("XeNG STAMPFIX: idx %d declinado: " motivo "\n", idx, ##__VA_ARGS__); } while (0)
 	auto *acc = *reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(em) + 0x10);
 	if (!acc) return ch;
-	if (*reinterpret_cast<int *>(acc + 0x11a0) <= idx && idx <= *reinterpret_cast<int *>(acc + 0x11a4)) return ch;  // display
+	if (*reinterpret_cast<int *>(acc + 0x11a0) <= idx && idx <= *reinterpret_cast<int *>(acc + 0x11a4)) { XE_STF_DECL("indice de display"); return ch; }
 	auto *task = *reinterpret_cast<void **>(acc + 0x150);
 	auto *stamps = task ? reinterpret_cast<volatile uint32_t *>(reinterpret_cast<void *(*)(void *)>(gStfGetStamps)(task)) : nullptr;
-	if (!stamps) return ch;
+	if (!stamps) { XE_STF_DECL("sem stamps"); return ch; }
 	volatile uint32_t *st = stamps + (uint32_t)idx * 16;
 	uint32_t ret = st[0], sub = st[2];
-	if (ret == sub || (int32_t)(sub - ret) < 0) { gStfN = 0; return ch; }
+	if (ret == sub || (int32_t)(sub - ret) < 0) { gStfN = 0; XE_STF_DECL("stamp nao esta atrasado (ret %x sub %x)", ret, sub); return ch; }
 	uint8_t cs = (*reinterpret_cast<uint64_t *>(acc + 0x1190) & 0x18000) ? gStfLutSci[idx] : gStfLut[idx];
 	auto *sched = *reinterpret_cast<uint8_t **>(acc + 0x1250);
 	auto *vt = sched ? *reinterpret_cast<mach_vm_address_t **>(sched) : nullptr;
-	if (!vt || vt[0x198 / 8] != gStfActive) return ch;
+	if (!vt || vt[0x198 / 8] != gStfActive) { XE_STF_DECL("vtable do scheduler"); return ch; }
 	void *a = nullptr, *b = nullptr; uint64_t t = 0;
 	reinterpret_cast<void (*)(void *, uint32_t, void **, uint64_t *, void **)>(gStfActive)(sched, cs, &a, &t, &b);
-	if (a || b) { gStfN = 0; return ch; }
+	if (a || b) { gStfN = 0; XE_STF_DECL("motor cs %u ainda tem contexto ativo (ret %x sub %x) a=%d b=%d", cs, ret, sub, a != nullptr, b != nullptr); return ch; }
 	if (gStfIdx == (uint32_t)idx && gStfVal == sub) gStfN++;
 	else { gStfIdx = (uint32_t)idx; gStfVal = sub; gStfN = 1; }
 	if (gStfN < 2) return ch;
