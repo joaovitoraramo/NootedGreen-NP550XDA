@@ -95,7 +95,7 @@ on this machine (the power object it asks depends on the GuC/SLPC, which is off 
 only ran fast because the hardware raised the clock on its own. The first GDRST reset that autonomous state and the GT
 stayed at RPn (~100 MHz, `RPSTAT1 0x1381b4 = 0x603125`, RC6 counter frozen) until the WindowServer died, which happened
 to idle the GT long enough to recover. Fix: the `XE-GTFREQ` floor from the XPS project now applies on real TGL too
-(commit `2515d0a`): a request of 0 becomes `ngreengtfreq` MHz (default 1500, the hardware clamps to RP0). After 4 resets
+(commit `7a8ae4a`): a request of 0 becomes `ngreengtfreq` MHz (default 1500, the hardware clamps to RP0). After 4 resets
 in the App Store the WindowServer stays at 57.7 fps, GT at ~1.1 GHz, Metal completion latency 0.4 ms.
 `-ngreennogtfreqtgl` restores the old behaviour. The notes below are kept as the record of what was ruled out.
 
