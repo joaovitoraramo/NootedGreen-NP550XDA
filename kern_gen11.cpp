@@ -13560,9 +13560,13 @@ static int xePokeSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sy
 	int o = snprintf(s, sizeof(s), "escreva \"reg val\" em hex");
 	return SYSCTL_OUT(req, s, (size_t)o + 1);
 }
+static int xeIrqStatSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);   // xe/irqdiag (definidos mais abaixo)
+static int xeIrqFixSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);
 SYSCTL_DECL(_debug);
 SYSCTL_NODE(_debug, OID_AUTO, xeng, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "NootedGreen NP550");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, ringregs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRingRegsSysctl, "A", "registradores dos aneis com forcewake");
+SYSCTL_PROC(_debug_xeng, OID_AUTO, irqstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeIrqStatSysctl, "A", "contadores de interrupcao e mascaras dos CS");
+SYSCTL_PROC(_debug_xeng, OID_AUTO, irqfix, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, nullptr, 0, xeIrqFixSysctl, "A", "religa a interrupcao do motor na ponte");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, poke, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, nullptr, 0, xePokeSysctl, "A", "escreve registrador: \"reg val\" hex");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, regs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRegsSysctl, "A", "registradores ao vivo");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, ringsample, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRingSampleSysctl, "A", "amostra do que os aneis executam");
@@ -13575,6 +13579,8 @@ static void xeRegsSysctlInstall() {
 	sysctl_register_oid(&sysctl__debug_xeng_ringsample);
 	sysctl_register_oid(&sysctl__debug_xeng_ringregs);
 	sysctl_register_oid(&sysctl__debug_xeng_poke);
+	sysctl_register_oid(&sysctl__debug_xeng_irqstat);
+	sysctl_register_oid(&sysctl__debug_xeng_irqfix);
 	IOLog("XeNG REGSYSCTL: debug.xeng.regs registrado\n");
 }
 // xe/regdiff: compara registradores da GT antes e depois de um reset do RCS, e entre resets. Depois dos resets com vídeo o
@@ -13815,6 +13821,71 @@ static void xeDisStampIrq(void *em, int idx, int flag) {
 	if (xeStampIrqJanela() && gStampIrqLogN++ < 60) IOLog("XeNG STAMPIRQ: disable idx %d flag %d -> mascara %llx n=%llu soft=%llu\n", idx, flag,
 		*reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(em) + 0xd40), *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(em) + 0xd80), *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(em) + 0xd90));
 }
+// xe/irqdiag (03/11): depois de um reset todo cliente da GPU passa a ver conclusões ~30-45 ms atrasadas (WindowServer a
+// 21 fps, xe-mtllong 30 ms) e só um WindowServer novo cura. Em IGHardwareCommandStreamer5::enableStampInterrupt a
+// interrupção do motor na IGInterruptBridge só é ligada quando a máscara de carimbos (cs+0xc0) passa de vazia a não
+// vazia; se o reset a desliga com a máscara cheia, ninguém religa até a máscara esvaziar (= o WindowServer morrer).
+// Conta as interrupções (filtro da ponte, stamp do EventMachine) e loga enable/disable da ponte na janela pós-reset.
+// `sysctl debug.xeng.irqstat` mostra os contadores e a máscara/refcounts de cada CS; `sysctl -w debug.xeng.irqfix=1`
+// religa a interrupção do motor de cada CS na ponte (experimento).
+static mach_vm_address_t gOrgIbFilter = 0, gOrgIbEnable = 0, gOrgIbDisable = 0, gOrgEmStampIrq = 0, gOrgIbEnables = 0, gOrgIbDisables = 0, gOrgIbClear = 0;
+static volatile uint32_t gIbFilterN = 0, gEmStampN = 0, gIbEnableN = 0, gIbDisableN = 0, gIbEnablesN = 0, gIbDisablesN = 0, gIbClearN = 0, gIrqLogN = 0;
+static bool xeIrqJanela() { return gRecLastResetT && gRecAbs3s && mach_absolute_time() - gRecLastResetT < gRecAbs3s * 40; }
+static bool xeIrqLoga() { uint32_t n = ++gIrqLogN; return n <= 48 || (xeIrqJanela() && n < 400); }
+static bool xeIbFilter(void *that, void *src) { gIbFilterN++; return FunctionCast(xeIbFilter, gOrgIbFilter)(that, src); }
+static void xeEmStampIrq(void *that, void *src, int n) { gEmStampN++; FunctionCast(xeEmStampIrq, gOrgEmStampIrq)(that, src, n); }
+static uint64_t xeIbEnable(void *that, uint32_t tipo) {
+	uint32_t n = ++gIbEnableN;
+	if (xeIrqLoga()) IOLog("XeNG IRQ: ponte enableInterrupt tipo %u (n=%u) de %p\n", tipo, n, __builtin_return_address(0));
+	return FunctionCast(xeIbEnable, gOrgIbEnable)(that, tipo);
+}
+static uint64_t xeIbDisable(void *that, uint32_t tipo) {
+	uint32_t n = ++gIbDisableN;
+	if (xeIrqLoga()) IOLog("XeNG IRQ: ponte disableInterrupt tipo %u (n=%u) de %p\n", tipo, n, __builtin_return_address(0));
+	return FunctionCast(xeIbDisable, gOrgIbDisable)(that, tipo);
+}
+static void xeIbEnables(void *that) { uint32_t n = ++gIbEnablesN; if (xeIrqLoga()) IOLog("XeNG IRQ: ponte enableInterrupts() n=%u de %p\n", n, __builtin_return_address(0)); FunctionCast(xeIbEnables, gOrgIbEnables)(that); }
+static void xeIbDisables(void *that) { uint32_t n = ++gIbDisablesN; if (xeIrqLoga()) IOLog("XeNG IRQ: ponte disableInterrupts() n=%u de %p\n", n, __builtin_return_address(0)); FunctionCast(xeIbDisables, gOrgIbDisables)(that); }
+static void xeIbClear(void *that) { uint32_t n = ++gIbClearN; if (xeIrqLoga()) IOLog("XeNG IRQ: ponte clearRequestors() n=%u de %p\n", n, __builtin_return_address(0)); FunctionCast(xeIbClear, gOrgIbClear)(that); }
+static int xeIrqStatSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
+	char b[900]; int o = 0;
+	o += snprintf(b + o, sizeof(b) - (size_t)o, "filtro=%u emstamp=%u enable=%u disable=%u enables=%u disables=%u clear=%u |", gIbFilterN, gEmStampN, gIbEnableN, gIbDisableN, gIbEnablesN, gIbDisablesN, gIbClearN);
+	for (int i = 0; i < 4 && o < (int)sizeof(b) - 120; i++) {
+		uint8_t *cs = gCs5Obj[i];
+		if (!cs) break;
+		auto *d = *reinterpret_cast<uint8_t **>(cs + 0x28);
+		uint32_t tipo = d ? *reinterpret_cast<uint32_t *>(d + 0x69) : 0xffffffff;
+		o += snprintf(b + o, sizeof(b) - (size_t)o, " cs%d tipo-irq %u mascara %llx ref:", i, tipo, *reinterpret_cast<uint64_t *>(cs + 0xc0));
+		for (int idx = 0; idx < 64 && o < (int)sizeof(b) - 24; idx++) {
+			uint32_t r = *reinterpret_cast<uint32_t *>(cs + 0x100 + idx * 4);
+			if (r) o += snprintf(b + o, sizeof(b) - (size_t)o, " %d=%u", idx, r);
+		}
+		o += snprintf(b + o, sizeof(b) - (size_t)o, ";");
+	}
+	return SYSCTL_OUT(req, b, (size_t)o + 1);
+}
+static int xeIrqFixSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
+	char s[32] = {0};
+	if (req->newptr) {
+		size_t n = req->newlen < sizeof(s) - 1 ? req->newlen : sizeof(s) - 1;
+		int err = SYSCTL_IN(req, s, n); if (err) return err;
+		if (!gOrgIbEnable) return ENXIO;
+		for (int i = 0; i < 4; i++) {
+			uint8_t *cs = gCs5Obj[i];
+			if (!cs) break;
+			auto *acc = *reinterpret_cast<uint8_t **>(cs + 0x10);
+			auto *d = *reinterpret_cast<uint8_t **>(cs + 0x28);
+			auto *ponte = acc ? *reinterpret_cast<void **>(acc + 0x1248) : nullptr;
+			if (!ponte || !d) continue;
+			uint32_t tipo = *reinterpret_cast<uint32_t *>(d + 0x69);
+			uint64_t r = FunctionCast(xeIbEnable, gOrgIbEnable)(ponte, tipo);
+			IOLog("XeNG IRQFIX: cs%d ponte %p enableInterrupt tipo %u -> %llx (mascara %llx)\n", i, ponte, tipo, r, *reinterpret_cast<uint64_t *>(cs + 0xc0));
+		}
+		return 0;
+	}
+	int o = snprintf(s, sizeof(s), "escreva 1");
+	return SYSCTL_OUT(req, s, (size_t)o + 1);
+}
 // xe/semdiag (03/11): o RCS passa ~30 ms por quadro em MI_SEMAPHORE_WAIT (poll) nos quadros do WindowServer degradado.
 // Loga as esperas inseridas no anel: índice do anel, índice esperado (widx), valor pedido e o que o stamp esperado já
 // tem (retornado/enviado). Primeiras 24 no boot e 80 nos 120 s após um reset; depois 1 a cada 2048.
@@ -13891,6 +13962,20 @@ static void xeStfInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		bool ok = RouteRequestPlus::routeAll(patcher, index, ri, address, size);
 		if (!ok) patcher.clearError();
 		IOLog("XeNG STAMPIRQ: hooks %s\n", ok ? "OK" : "FALHOU");
+	}
+	{
+		RouteRequestPlus ri[] = {   // xe/irqdiag
+			{"__ZN17IGInterruptBridge22interruptFilterHandlerEP28IOFilterInterruptEventSource", xeIbFilter, gOrgIbFilter},
+			{"__ZN19IGAccelEventMachine29handleSchedulerStampInterruptEP22IOInterruptEventSourcei", xeEmStampIrq, gOrgEmStampIrq},
+			{"__ZN17IGInterruptBridge15enableInterruptEj", xeIbEnable, gOrgIbEnable},
+			{"__ZN17IGInterruptBridge16disableInterruptEj", xeIbDisable, gOrgIbDisable},
+			{"__ZN17IGInterruptBridge16enableInterruptsEv", xeIbEnables, gOrgIbEnables},
+			{"__ZN17IGInterruptBridge17disableInterruptsEv", xeIbDisables, gOrgIbDisables},
+			{"__ZN17IGInterruptBridge15clearRequestorsEv", xeIbClear, gOrgIbClear},
+		};
+		bool ok = RouteRequestPlus::routeAll(patcher, index, ri, address, size);
+		if (!ok) patcher.clearError();
+		IOLog("XeNG IRQ: hooks %s\n", ok ? "OK" : "FALHOU");
 	}
 	if (evto && gStfGetStamps && gStfSignal && gStfActive && sig) {
 		RouteRequestPlus r[] = {
