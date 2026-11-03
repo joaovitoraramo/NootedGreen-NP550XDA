@@ -7,8 +7,8 @@ Metal acceleration. The kext source is in the root of this repository (one file 
 `src/NootedGreen`); the diagnostic and test tools we wrote along the way are in `tools/`.
 
 This is a working daily machine as of 2026-11-03: Xcode 26.1.1 + iOS simulator, Docker Desktop, App Store, hardware video
-decode, 9 h 23 min of continuous logged-in use overnight with zero GPU resets. One problem remains open (the idle login-screen freeze, see below) and **we are looking for help on it**; the post-reset
-slowdown was solved on 2026-11-03 (GT frequency floor).
+decode, 9 h 23 min of continuous logged-in use overnight with zero GPU resets. Three problems remain open (see below) and **we are looking for help on them**; the post-reset slowdown was solved on
+2026-11-03 (GT frequency floor).
 
 ## Hardware and software
 
@@ -26,7 +26,7 @@ slowdown was solved on 2026-11-03 (GT frequency floor).
 Boot arguments in daily use:
 
 ```
-keepsyms=1 debug=0x100 -vi2c-force-polling msgbuf=1048576 -ngreenblr -ngreenfbdpmstgl ngreenblmax=17741
+keepsyms=1 debug=0x100 ipc_control_port_options=0 -vi2c-force-polling msgbuf=1048576 -ngreenblr -ngreenfbdpmstgl ngreenblmax=17741
 ngreencon3type=2048 -ngreenhdmiemu -ngreenhdmiout -ngreenhdmigammaoff -ngreentglwithgfx ngreenSched=3 ngreen-dmc=tgl
 -ngreentgltahoe -ngreenfixbootmode amfi_get_out_of_my_way=1 -allow3d -disablegfxfirmware itlwm_he=1 -ngreengva
 ```
@@ -43,8 +43,11 @@ ngreencon3type=2048 -ngreenhdmiemu -ngreenhdmiout -ngreenhdmigammaoff -ngreentgl
 
 - Logged-in session: 9 h 23 min overnight, zero GPU resets, zero freezes; ~14 h accumulated without a single failure while
   a user session exists.
-- GPU resets happen **only** while a video plays in the App Store (the media batches of the VA plugin hang the RCS,
-  recovered by our GPUREC; see open problem 2). Plain hardware decode in a test app (`tools/gva/xe-vtcase.m`) never resets.
+- App Store video no longer resets the GPU with `tools/gva/patch-va-no-videoprocessing.py` applied to the VA plugin (one
+  session tested: 0 resets, 0 media batches, correct colours). Trade-off: H.264 falls back to software; HEVC stays in
+  hardware. The cause of the media hang is still unknown, so this is a workaround.
+- `ipc_control_port_options=0` is needed next to `amfi_get_out_of_my_way=1`: without it Firefox content processes die with
+  `EXC_GUARD GUARD_TYPE_MACH_PORT` and the browser never opens a window.
 - The idle **login screen with no session** has died 3 times (13 min, 21 min and 112 min after boot): total freeze, no
   panic, no trace in the kernel log, last kernel line is the normal 1 Hz clock blit of SecurityAgent (open problem 1).
 
@@ -88,7 +91,18 @@ kernel log beyond the normal per-second SecurityAgent blit, no GPU reset before 
 testing: deepest idle state of the platform (no Docker VM, no user session), something in the login-screen render path.
 A 1 kHz CPU wake-up keepalive test is prepared.
 
-### 2. Persistent slowdown of the living WindowServer after GPU resets — SOLVED 2026-11-03
+### 2. Video windows saturate the RCS
+
+With a plain 720p HEVC video in a window (2.8 Mbps, hardware decode, no resets, no dropped frames) a CAMetalLayer test falls
+from 58 to 38 fps: the RCS is busy about 95% of the time with IPEHR at `PIPE_CONTROL`, ACTHD advancing, GT at 900-1100 MHz
+while 1500 MHz is requested (`GT0_PERF_LIMIT_REASONS 0x1381a8` reads `0x21010100`/`0x21012000`). A paused video in the App
+Store keeps the dock animation slow; quitting the app restores it. What the WindowServer submits per frame is not known yet.
+
+### 3. Media batches of the VA plugin hang the RCS
+
+See `tools/gva/patch-va-no-videoprocessing.py` for the workaround and what it costs.
+
+### Solved: persistent slowdown of the living WindowServer after GPU resets (2026-11-03)
 
 **Root cause: GT frequency.** Apple's `IGHardwareCommandStreamer5::setGTFrequencyMMIO` requests frequency 0 on every call
 on this machine (the power object it asks depends on the GuC/SLPC, which is off with `-disablegfxfirmware`), so the GT

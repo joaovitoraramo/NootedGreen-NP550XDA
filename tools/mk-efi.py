@@ -117,7 +117,7 @@ BOOTARGS_F1 = '-v keepsyms=1 debug=0x100 -vi2c-force-polling'
 # ngreenV142 so vale no caminho nao-TGL; saiu.
 # -ngreengva (01/11): video por hardware (plugin VA do XPS em /Library/GPUBundles + XE-GVAID/GVAHEVC no TGL real). 02/11: trava o RCS
 # nos lotes de midia do VTDecoderXPCService (PIPELINE_SELECT=1, MEDIA_OBJECT); Joao decidiu manter e corrigir a causa, nao desligar.
-BOOTARGS_F2 = ('-v keepsyms=1 debug=0x100 -vi2c-force-polling msgbuf=1048576 -ngreenblr '
+BOOTARGS_F2 = ('-v keepsyms=1 debug=0x100 ipc_control_port_options=0 -vi2c-force-polling msgbuf=1048576 -ngreenblr '
                '-ngreenfbdpmstgl ngreenblmax=17741 ngreencon3type=2048 -ngreenhpdtrace -ngreenhdmiemu -ngreenhdmiout -ngreenhdmigammaoff -ngreentglwithgfx ngreenSched=3 ngreen-dmc=tgl -ngreentgltahoe -ngreenfixbootmode IGLogLevel=3 '
                'amfi_get_out_of_my_way=1 -allow3d -disablegfxfirmware shda-lang=pt_BR itlwm_he=1 -ngreengva')
 # Fase 3 (final, uso diario): a fase 2 sem o verbose, sem o trace de HPD e sem o IGLogLevel. keepsyms/debug=0x100
