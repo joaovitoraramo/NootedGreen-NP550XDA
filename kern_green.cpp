@@ -361,6 +361,22 @@ void NGreen::setApertureIfNecessary() {
 // inteiro (então é a GPU que vê outra página: mapeamento/coerência) ou se o lote foi mesmo cortado (pool), guarda as
 // últimas submissões de cada pool (IOAccelCommandBufferPool2::submitBuffer: descritor em pool+0x1860: +0x18 endereço
 // GPU, +0x20 ponteiro CPU, +0x30 dwords) e os pools criados; xeSubDump() é chamado pelo XE-GPUREC antes do reset.
+// xe/dropdiag: ver dropRequest[] abaixo. desc+0x10 = contexto, desc+0x30 = dwords (zerado pelo IOAF quando descarta).
+static mach_vm_address_t orgChSubmitCommands = 0;
+static void wrapChSubmitCommands(void *ch, uint8_t *desc) {
+	uint32_t antes = desc ? *reinterpret_cast<uint32_t *>(desc + 0x30) : 0;
+	FunctionCast(wrapChSubmitCommands, orgChSubmitCommands)(ch, desc);
+	if (!desc || !antes || *reinterpret_cast<uint32_t *>(desc + 0x30) != 0) return;
+	static uint32_t n = 0;
+	n++;
+	if (n > 16 && (n & 63)) return;
+	char nome[32] = "?";
+	int pid = proc_selfpid();
+	proc_name(pid, nome, sizeof(nome));
+	IOLog("XeNG DROPDIAG[%u]: envio de %u dwords descartado: ctx %llx canal %llx pid %d %s\n", n, antes,
+	      (uint64_t)*reinterpret_cast<void **>(desc + 0x10), (uint64_t)ch, pid, nome);
+}
+
 struct XeSub { void *pool; uint64_t gpu, cpu; uint32_t ndw; int16_t idx; uint64_t t; };
 static XeSub gXeSubs[64];
 static volatile uint32_t gXeSubN = 0;
@@ -730,6 +746,14 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			if (!ok) patcher.clearError();
 			IOLog("XeNG NOORPHAN: IOAccelOrphanedMemoryPool::getMemory -> sem reuso: %s\n", ok ? "hooked" : "NAO encontrado");
 		}
+
+		// xe/dropdiag (02/11 23h): depois dos resets com vídeo, o IOAF descarta envios de algum contexto ("dropping ctx ...
+		// commands on floor") e o desktop fica lento até o reboot. Diz de quem é o contexto descartado.
+		RouteRequestPlus dropRequest[] = {
+			{"__ZN18IOAccelFIFOChannel214submitCommandsEP24IOAccelCommandDescriptor", wrapChSubmitCommands, orgChSubmitCommands},
+		};
+		if (!RouteRequestPlus::routeAll(patcher, index, dropRequest, address, size)) { patcher.clearError(); IOLog("XeNG DROPDIAG: hook FALHOU\n"); }
+		else IOLog("XeNG DROPDIAG: hook submitCommands OK\n");
 
 		// xe/pool: tamanho mínimo dos buffers de comando (ver wrapPoolInit).
 		RouteRequestPlus poolRequest[] = {
