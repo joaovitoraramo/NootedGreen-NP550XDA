@@ -7,8 +7,8 @@ Metal acceleration. The kext source is in the root of this repository (one file 
 `src/NootedGreen`); the diagnostic and test tools we wrote along the way are in `tools/`.
 
 This is a working daily machine as of 2026-11-03: Xcode 26.1.1 + iOS simulator, Docker Desktop, App Store, hardware video
-decode, 9 h 23 min of continuous logged-in use overnight with zero GPU resets. Two problems remain open (see below) and
-**we are looking for help on them**.
+decode, 9 h 23 min of continuous logged-in use overnight with zero GPU resets. One problem remains open (the idle login-screen freeze, see below) and **we are looking for help on it**; the post-reset
+slowdown was solved on 2026-11-03 (GT frequency floor).
 
 ## Hardware and software
 
@@ -88,7 +88,18 @@ kernel log beyond the normal per-second SecurityAgent blit, no GPU reset before 
 testing: deepest idle state of the platform (no Docker VM, no user session), something in the login-screen render path.
 A 1 kHz CPU wake-up keepalive test is prepared.
 
-### 2. Persistent slowdown of the living WindowServer after GPU resets
+### 2. Persistent slowdown of the living WindowServer after GPU resets — SOLVED 2026-11-03
+
+**Root cause: GT frequency.** Apple's `IGHardwareCommandStreamer5::setGTFrequencyMMIO` requests frequency 0 on every call
+on this machine (the power object it asks depends on the GuC/SLPC, which is off with `-disablegfxfirmware`), so the GT
+only ran fast because the hardware raised the clock on its own. The first GDRST reset that autonomous state and the GT
+stayed at RPn (~100 MHz, `RPSTAT1 0x1381b4 = 0x603125`, RC6 counter frozen) until the WindowServer died, which happened
+to idle the GT long enough to recover. Fix: the `XE-GTFREQ` floor from the XPS project now applies on real TGL too
+(commit `2515d0a`): a request of 0 becomes `ngreengtfreq` MHz (default 1500, the hardware clamps to RP0). After 4 resets
+in the App Store the WindowServer stays at 57.7 fps, GT at ~1.1 GHz, Metal completion latency 0.4 ms.
+`-ngreennogtfreqtgl` restores the old behaviour. The notes below are kept as the record of what was ruled out.
+
+Original description:
 
 Playing a video in the App Store triggers RCS hangs every 10-16 s (VA plugin media batches: `PIPELINE_SELECT` media,
 `MEDIA_VFE_STATE` with scoreboard, `MEDIA_INTERFACE_DESCRIPTOR_LOAD`, second-level `MI_BATCH_BUFFER_START` with
