@@ -13329,6 +13329,8 @@ static uint64_t xeRecChSubmitBuffer(void *ch, uint8_t *desc) {
 // (+64 B para o MI_BATCH_BUFFER_END que a Apple acrescenta) e mfence. -ngreennocmdflush desliga.
 static volatile uint32_t gXeFlushN = 0;
 static int gXeFlushOn = -1;
+static void xeStampScan(void *acc);   // xe/stampdump (definida junto do STAMPFIX)
+static uint64_t gRecLastResetT = 0;
 struct XeBb { void *ring; uint64_t addr; uint32_t seq, hdr; int pid; uint8_t type; int8_t sidx; uint8_t flushed; uint64_t t; void *caller; };
 static XeBb gXeBbs[128];
 static volatile uint32_t gXeBbN = 0;
@@ -13352,6 +13354,11 @@ static uint64_t xeRecSubmitBatchBuffer(void *ring, uint64_t addr, uint32_t seq, 
 	e.sidx = r ? (int8_t)*reinterpret_cast<int *>(r + 0x38) : -1; e.t = mach_absolute_time(); e.caller = __builtin_return_address(0);
 	e.flushed = 0;
 	if (hdr && r && r[0x40] == 0) xeBbCopy(addr, hdr);
+	if (gRecLastResetT && gRecAbs3s) {   // xe/stampdump: a cada 5 s nos 90 s seguintes a um reset, lista stamps atrasados
+		static uint64_t last = 0;
+		uint64_t now = mach_absolute_time();
+		if (now - gRecLastResetT < gRecAbs3s * 30 && now - last > gRecAbs3s * 5 / 3) { last = now; xeStampScan(r ? *reinterpret_cast<void **>(r + 0x10) : nullptr); }
+	}
 	// 02/11 12:39: com o flush ligado a máquina morreu de vez (log e ps param no mesmo segundo, sem hang de GPU, sem relatório):
 	// suspeita de clflush em ponteiro de CPU já solto -> page fault no kernel. Agora só liga com -ngreencmdflush.
 	if (gXeFlushOn < 0) gXeFlushOn = checkKernelArgument("-ngreencmdflush") ? 1 : 0;
@@ -13539,7 +13546,7 @@ static bool xeRecResetGraphicsEngine(void *ring, void *ctx) {
 		static uint64_t lastT = 0;
 		uint64_t now = mach_absolute_time();
 		gRecStorm = (lastT && now - lastT < gRecAbs3s) ? gRecStorm + 1 : 0;
-		lastT = now;
+		lastT = now; gRecLastResetT = now;
 		if (own == 0 && (gRecResets < 12 || gRecStorm < 4 || !(gRecStorm & 63))) {
 			uint32_t acthd = xeRecRd(mmio, 0x2074), bb = xeRecRd(mmio, 0x2140), ipehr = xeRecRd(mmio, 0x2068);
 			IOLog("XeNG HANGDIAG: antes do reset #%u storm=%u ACTHD %08x BB %08x IPEHR %08x EIR %08x ESR %08x HEAD %05x TAIL %05x ELSTAT %08x/%08x\n",
@@ -13670,6 +13677,34 @@ static void *xeStfEventTimeout(void *em, int idx) {
 	svc->setProperty("xe-rec-stampfix", gStfFix, 32);
 	svc->setProperty("xe-rec-stampfix-last", gStfLast, 32);
 	return ch;
+}
+
+// xe/stampdump + xe/dispstampfix (02/11 23h): depois de resets com vídeo a tela fica a ~18 fps (xe-present) com GPU ociosa e
+// latência Metal normal: suspeita de stamp de DISPLAY (índices acc+0x11a0..0x11a4, que o STAMPFIX pula) perdido no
+// reset -> cada flip espera timeout. Lista os stamps atrasados; com -ngreendispstampfix, um stamp de display parado em
+// duas varreduras seguidas (10 s) é dado como concluído (retornado = enviado) e os que esperam são avisados.
+static uint32_t gStampPrevRet[64], gStampPrevSub[64], gDispFixN = 0;
+static void xeStampScan(void *accv) {
+	auto *acc = static_cast<uint8_t *>(accv);
+	if (!acc || !gStfGetStamps) return;
+	static int fix = -1;
+	if (fix < 0) fix = checkKernelArgument("-ngreendispstampfix") ? 1 : 0;
+	auto *task = *reinterpret_cast<void **>(acc + 0x150);
+	auto *stamps = task ? reinterpret_cast<volatile uint32_t *>(reinterpret_cast<void *(*)(void *)>(gStfGetStamps)(task)) : nullptr;
+	if (!stamps) return;
+	int d0 = *reinterpret_cast<int *>(acc + 0x11a0), d1 = *reinterpret_cast<int *>(acc + 0x11a4);
+	uint32_t n = 0; uint64_t bits = 0;
+	for (int idx = 0; idx < 64; idx++) {
+		volatile uint32_t *st = stamps + (uint32_t)idx * 16;
+		uint32_t ret = st[0], sub = st[2];
+		bool disp = d0 <= idx && idx <= d1, atras = sub != ret && (int32_t)(sub - ret) > 0;
+		bool parado = atras && gStampPrevSub[idx] == sub && gStampPrevRet[idx] == ret;
+		if (atras && n++ < 10) IOLog("XeNG STAMPS: idx %d%s retornado 0x%x enviado 0x%x%s\n", idx, disp ? " (display)" : "", ret, sub, parado ? " PARADO" : "");
+		if (fix == 1 && disp && parado) { st[0] = sub; bits |= 1ULL << idx; gDispFixN++; IOLog("XeNG DISPSTAMPFIX: idx %d 0x%x -> 0x%x (n=%u)\n", idx, ret, sub, gDispFixN); }
+		gStampPrevSub[idx] = sub; gStampPrevRet[idx] = ret;
+	}
+	if (bits && gStfSignal) reinterpret_cast<void (*)(void *, const uint64_t *)>(gStfSignal)(acc, &bits);
+	IOLog("XeNG STAMPS: %u atrasados (display %d..%d)\n", n, d0, d1);
 }
 
 static void xeStfInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
