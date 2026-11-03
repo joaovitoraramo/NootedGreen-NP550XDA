@@ -13833,6 +13833,22 @@ static volatile uint32_t gIbFilterN = 0, gEmStampN = 0, gIbEnableN = 0, gIbDisab
 static bool xeIrqJanela() { return gRecLastResetT && gRecAbs3s && mach_absolute_time() - gRecLastResetT < gRecAbs3s * 40; }
 static bool xeIrqLoga() { uint32_t n = ++gIrqLogN; return n <= 48 || (xeIrqJanela() && n < 400); }
 static bool xeIbFilter(void *that, void *src) { gIbFilterN++; return FunctionCast(xeIbFilter, gOrgIbFilter)(that, src); }
+static mach_vm_address_t gOrgIbHandler = 0, gOrgCsFlushHw = 0, gOrgCsFlush2 = 0, gOrgCsEnStamp = 0, gOrgCsDisStamp = 0;
+static volatile uint32_t gIbHandlerN = 0, gCsFlushHwN = 0, gCsFlush2N = 0, gCsEnStampN = 0, gCsDisStampN = 0;
+static void xeCsGuarda(void *cs) { for (int i = 0; i < 4; i++) { if (gCs5Obj[i] == cs) return; if (!gCs5Obj[i]) { gCs5Obj[i] = static_cast<uint8_t *>(cs); return; } } }
+static void xeIbHandler(void *that, void *src, int n) { gIbHandlerN++; FunctionCast(xeIbHandler, gOrgIbHandler)(that, src, n); }
+static void xeCsFlushHw(void *cs, void *a, void *b) { gCsFlushHwN++; xeCsGuarda(cs); FunctionCast(xeCsFlushHw, gOrgCsFlushHw)(cs, a, b); }
+static void xeCsFlush2(void *cs, void *src, int n) { gCsFlush2N++; xeCsGuarda(cs); FunctionCast(xeCsFlush2, gOrgCsFlush2)(cs, src, n); }
+static void xeCsEnStamp(void *cs, int idx) {
+	xeCsGuarda(cs); gCsEnStampN++;
+	FunctionCast(xeCsEnStamp, gOrgCsEnStamp)(cs, idx);
+	if (xeIrqLoga()) IOLog("XeNG IRQ: cs %p enableStampInterrupt idx %d -> ref %u mascara %llx\n", cs, idx, idx >= 0 && idx < 64 ? *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(cs) + 0x100 + idx * 4) : 0, *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(cs) + 0xc0));
+}
+static void xeCsDisStamp(void *cs, int idx) {
+	xeCsGuarda(cs); gCsDisStampN++;
+	FunctionCast(xeCsDisStamp, gOrgCsDisStamp)(cs, idx);
+	if (xeIrqLoga()) IOLog("XeNG IRQ: cs %p disableStampInterrupt idx %d -> ref %u mascara %llx\n", cs, idx, idx >= 0 && idx < 64 ? *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(cs) + 0x100 + idx * 4) : 0, *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(cs) + 0xc0));
+}
 static void xeEmStampIrq(void *that, void *src, int n) { gEmStampN++; FunctionCast(xeEmStampIrq, gOrgEmStampIrq)(that, src, n); }
 static uint64_t xeIbEnable(void *that, uint32_t tipo) {
 	uint32_t n = ++gIbEnableN;
@@ -13849,7 +13865,7 @@ static void xeIbDisables(void *that) { uint32_t n = ++gIbDisablesN; if (xeIrqLog
 static void xeIbClear(void *that) { uint32_t n = ++gIbClearN; if (xeIrqLoga()) IOLog("XeNG IRQ: ponte clearRequestors() n=%u de %p\n", n, __builtin_return_address(0)); FunctionCast(xeIbClear, gOrgIbClear)(that); }
 static int xeIrqStatSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
 	char b[900]; int o = 0;
-	o += snprintf(b + o, sizeof(b) - (size_t)o, "filtro=%u emstamp=%u enable=%u disable=%u enables=%u disables=%u clear=%u |", gIbFilterN, gEmStampN, gIbEnableN, gIbDisableN, gIbEnablesN, gIbDisablesN, gIbClearN);
+	o += snprintf(b + o, sizeof(b) - (size_t)o, "filtro=%u handler=%u emstamp=%u flushhw=%u flush2=%u csen=%u csdis=%u enable=%u disable=%u enables=%u disables=%u clear=%u |", gIbFilterN, gIbHandlerN, gEmStampN, gCsFlushHwN, gCsFlush2N, gCsEnStampN, gCsDisStampN, gIbEnableN, gIbDisableN, gIbEnablesN, gIbDisablesN, gIbClearN);
 	for (int i = 0; i < 4 && o < (int)sizeof(b) - 120; i++) {
 		uint8_t *cs = gCs5Obj[i];
 		if (!cs) break;
@@ -13972,6 +13988,11 @@ static void xeStfInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			{"__ZN17IGInterruptBridge16enableInterruptsEv", xeIbEnables, gOrgIbEnables},
 			{"__ZN17IGInterruptBridge17disableInterruptsEv", xeIbDisables, gOrgIbDisables},
 			{"__ZN17IGInterruptBridge15clearRequestorsEv", xeIbClear, gOrgIbClear},
+			{"__ZN17IGInterruptBridge16interruptHandlerEP22IOInterruptEventSourcei", xeIbHandler, gOrgIbHandler},
+			{"__ZN26IGHardwareCommandStreamer533handleHardwareFlushNotifyInterruptEP8OSObjectPv", xeCsFlushHw, gOrgCsFlushHw},
+			{"__ZN26IGHardwareCommandStreamer534handleFlushNotifyInterruptSecondaryEP22IOInterruptEventSourcei", xeCsFlush2, gOrgCsFlush2},
+			{"__ZN26IGHardwareCommandStreamer520enableStampInterruptEi", xeCsEnStamp, gOrgCsEnStamp},
+			{"__ZN26IGHardwareCommandStreamer521disableStampInterruptEi", xeCsDisStamp, gOrgCsDisStamp},
 		};
 		bool ok = RouteRequestPlus::routeAll(patcher, index, ri, address, size);
 		if (!ok) patcher.clearError();
