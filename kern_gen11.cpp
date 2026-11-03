@@ -13835,36 +13835,26 @@ static bool xeIrqLoga() { uint32_t n = ++gIrqLogN; return n <= 48 || (xeIrqJanel
 static bool xeIbFilter(void *that, void *src) { gIbFilterN++; return FunctionCast(xeIbFilter, gOrgIbFilter)(that, src); }
 static mach_vm_address_t gOrgIbHandler = 0, gOrgCsFlushHw = 0, gOrgCsFlush2 = 0, gOrgCsEnStamp = 0, gOrgCsDisStamp = 0;
 static volatile uint32_t gIbHandlerN = 0, gCsFlushHwN = 0, gCsFlush2N = 0, gCsEnStampN = 0, gCsDisStampN = 0;
+struct XeIrqEv { uint8_t op; uint32_t tipo; uint64_t t; void *de; };
+static XeIrqEv gIrqEv[64]; static volatile uint32_t gIrqEvN = 0;
+static inline void xeIrqEv(uint8_t op, uint32_t tipo, void *de) { auto &e = gIrqEv[gIrqEvN++ % 64]; e.op = op; e.tipo = tipo; e.t = mach_absolute_time(); e.de = de; }
 static void xeCsGuarda(void *cs) { for (int i = 0; i < 4; i++) { if (gCs5Obj[i] == cs) return; if (!gCs5Obj[i]) { gCs5Obj[i] = static_cast<uint8_t *>(cs); return; } } }
 static void xeIbHandler(void *that, void *src, int n) { gIbHandlerN++; FunctionCast(xeIbHandler, gOrgIbHandler)(that, src, n); }
 static void xeCsFlushHw(void *cs, void *a, void *b) { gCsFlushHwN++; xeCsGuarda(cs); FunctionCast(xeCsFlushHw, gOrgCsFlushHw)(cs, a, b); }
 static void xeCsFlush2(void *cs, void *src, int n) { gCsFlush2N++; xeCsGuarda(cs); FunctionCast(xeCsFlush2, gOrgCsFlush2)(cs, src, n); }
-static void xeCsEnStamp(void *cs, int idx) {
-	xeCsGuarda(cs); gCsEnStampN++;
-	FunctionCast(xeCsEnStamp, gOrgCsEnStamp)(cs, idx);
-	if (xeIrqLoga()) IOLog("XeNG IRQ: cs %p enableStampInterrupt idx %d -> ref %u mascara %llx\n", cs, idx, idx >= 0 && idx < 64 ? *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(cs) + 0x100 + idx * 4) : 0, *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(cs) + 0xc0));
-}
-static void xeCsDisStamp(void *cs, int idx) {
-	xeCsGuarda(cs); gCsDisStampN++;
-	FunctionCast(xeCsDisStamp, gOrgCsDisStamp)(cs, idx);
-	if (xeIrqLoga()) IOLog("XeNG IRQ: cs %p disableStampInterrupt idx %d -> ref %u mascara %llx\n", cs, idx, idx >= 0 && idx < 64 ? *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(cs) + 0x100 + idx * 4) : 0, *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(cs) + 0xc0));
-}
+// Também sem IOLog (o chamador pode segurar o stampInterruptLock do EventMachine): só o anel de eventos (op S/s, tipo = idx).
+static void xeCsEnStamp(void *cs, int idx) { xeCsGuarda(cs); gCsEnStampN++; FunctionCast(xeCsEnStamp, gOrgCsEnStamp)(cs, idx); xeIrqEv('S', (uint32_t)idx, cs); }
+static void xeCsDisStamp(void *cs, int idx) { xeCsGuarda(cs); gCsDisStampN++; FunctionCast(xeCsDisStamp, gOrgCsDisStamp)(cs, idx); xeIrqEv('s', (uint32_t)idx, cs); }
 static void xeEmStampIrq(void *that, void *src, int n) { gEmStampN++; FunctionCast(xeEmStampIrq, gOrgEmStampIrq)(that, src, n); }
-static uint64_t xeIbEnable(void *that, uint32_t tipo) {
-	uint32_t n = ++gIbEnableN;
-	if (xeIrqLoga()) IOLog("XeNG IRQ: ponte enableInterrupt tipo %u (n=%u) de %p\n", tipo, n, __builtin_return_address(0));
-	return FunctionCast(xeIbEnable, gOrgIbEnable)(that, tipo);
-}
-static uint64_t xeIbDisable(void *that, uint32_t tipo) {
-	uint32_t n = ++gIbDisableN;
-	if (xeIrqLoga()) IOLog("XeNG IRQ: ponte disableInterrupt tipo %u (n=%u) de %p\n", tipo, n, __builtin_return_address(0));
-	return FunctionCast(xeIbDisable, gOrgIbDisable)(that, tipo);
-}
-static void xeIbEnables(void *that) { uint32_t n = ++gIbEnablesN; if (xeIrqLoga()) IOLog("XeNG IRQ: ponte enableInterrupts() n=%u de %p\n", n, __builtin_return_address(0)); FunctionCast(xeIbEnables, gOrgIbEnables)(that); }
-static void xeIbDisables(void *that) { uint32_t n = ++gIbDisablesN; if (xeIrqLoga()) IOLog("XeNG IRQ: ponte disableInterrupts() n=%u de %p\n", n, __builtin_return_address(0)); FunctionCast(xeIbDisables, gOrgIbDisables)(that); }
-static void xeIbClear(void *that) { uint32_t n = ++gIbClearN; if (xeIrqLoga()) IOLog("XeNG IRQ: ponte clearRequestors() n=%u de %p\n", n, __builtin_return_address(0)); FunctionCast(xeIbClear, gOrgIbClear)(that); }
+// Os métodos da ponte são chamados com o spinlock do CS seguro (enableStampInterrupt faz lck_spin_lock antes): NADA de
+// IOLog aqui (03/11 11:21: congelou no login com o log dentro). Só contadores e um anel de eventos lido pelo sysctl.
+static uint64_t xeIbEnable(void *that, uint32_t tipo) { gIbEnableN++; xeIrqEv('E', tipo, __builtin_return_address(0)); return FunctionCast(xeIbEnable, gOrgIbEnable)(that, tipo); }
+static uint64_t xeIbDisable(void *that, uint32_t tipo) { gIbDisableN++; xeIrqEv('D', tipo, __builtin_return_address(0)); return FunctionCast(xeIbDisable, gOrgIbDisable)(that, tipo); }
+static void xeIbEnables(void *that) { gIbEnablesN++; xeIrqEv('e', 0, __builtin_return_address(0)); FunctionCast(xeIbEnables, gOrgIbEnables)(that); }
+static void xeIbDisables(void *that) { gIbDisablesN++; xeIrqEv('d', 0, __builtin_return_address(0)); FunctionCast(xeIbDisables, gOrgIbDisables)(that); }
+static void xeIbClear(void *that) { gIbClearN++; xeIrqEv('c', 0, __builtin_return_address(0)); FunctionCast(xeIbClear, gOrgIbClear)(that); }
 static int xeIrqStatSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
-	char b[900]; int o = 0;
+	char b[1400]; int o = 0;
 	o += snprintf(b + o, sizeof(b) - (size_t)o, "filtro=%u handler=%u emstamp=%u flushhw=%u flush2=%u csen=%u csdis=%u enable=%u disable=%u enables=%u disables=%u clear=%u |", gIbFilterN, gIbHandlerN, gEmStampN, gCsFlushHwN, gCsFlush2N, gCsEnStampN, gCsDisStampN, gIbEnableN, gIbDisableN, gIbEnablesN, gIbDisablesN, gIbClearN);
 	for (int i = 0; i < 4 && o < (int)sizeof(b) - 120; i++) {
 		uint8_t *cs = gCs5Obj[i];
@@ -13878,6 +13868,9 @@ static int xeIrqStatSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct
 		}
 		o += snprintf(b + o, sizeof(b) - (size_t)o, ";");
 	}
+	o += snprintf(b + o, sizeof(b) - (size_t)o, " | eventos:");
+	uint32_t n = gIrqEvN, ini = n > 24 ? n - 24 : 0;
+	for (uint32_t i = ini; i < n && o < (int)sizeof(b) - 40; i++) { auto &e = gIrqEv[i % 64]; o += snprintf(b + o, sizeof(b) - (size_t)o, " %c:%x@%llu", e.op, e.tipo, e.t / 1000000); }
 	return SYSCTL_OUT(req, b, (size_t)o + 1);
 }
 static int xeIrqFixSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
