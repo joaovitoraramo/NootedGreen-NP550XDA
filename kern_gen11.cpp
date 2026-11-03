@@ -8291,7 +8291,15 @@ void Gen11::blit3d_initialize_scratch_space(void *that)
 // padrão 1500 = RP0 desde 20/10 noite, antes 1100; 0 desliga). Ocioso a GPU entra em RC6 de qualquer jeito, então o piso só vale com trabalho.
 void Gen11::wrapSetGTFrequencyMMIO(void *that, uint32_t val)
 {
-	if (NGreen::callback && NGreen::callback->isRealTGL) {
+	// 03/11 (TGL real): depois de um reset de GPU a GT fica no RPn (RPSTAT1 0x603125, RPNSWREQ lido 0 antes de cada escrita,
+	// RC6 parado) e o WindowServer vivo cai a 21 fps até morrer. O piso abaixo passa a valer também no TGL real;
+	// -ngreennogtfreqtgl volta ao comportamento antigo (pedido da Apple sem piso).
+	static int tglSemPiso = -1;
+	if (tglSemPiso < 0) tglSemPiso = checkKernelArgument("-ngreennogtfreqtgl") ? 1 : 0;
+	static uint32_t nLog = 0; static uint32_t ultimo = 0xffffffff;
+	if (val != ultimo && nLog++ < 40) { IOLog("XeNG GTFREQ: pedido da Apple %x (n=%u)\n", val, gXeGtFreqN + 1); ultimo = val; }
+	if (NGreen::callback && NGreen::callback->isRealTGL && tglSemPiso) {
+		gXeGtFreqApple = val; gXeGtFreqN++;
 		FunctionCast(wrapSetGTFrequencyMMIO, callback->oSetGTFrequencyMMIO)(that, val);
 		return;
 	}
@@ -13489,8 +13497,9 @@ static int xeRegsSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sy
 	for (auto &e : kXeRegLive) {
 		uint32_t v = NGreen::callback ? NGreen::callback->readReg32(e.reg) : 0xdeaddead;
 		o += snprintf(b + o, sizeof(b) - (size_t)o, "%s=%08x ", e.nome, v);
-		if (o >= (int)sizeof(b) - 24) break;
+		if (o >= (int)sizeof(b) - 48) break;
 	}
+	o += snprintf(b + o, sizeof(b) - (size_t)o, "gtreq-apple=%08x n=%u ", gXeGtFreqApple, gXeGtFreqN);
 	return SYSCTL_OUT(req, b, (size_t)o + 1);
 }
 // xe/ringsample: `sysctl debug.xeng.ringsample` amostra por 2 s (10 ms) o que o RCS e o BCS estão executando (IPEHR,
@@ -13527,7 +13536,7 @@ static int xeRingRegsSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struc
 	char b[256]; int o = 0, err = 0;
 	auto *acc = gXeAccLive; auto *mmio = gXeMmioLive;
 	if (!acc || !mmio) { o = snprintf(b, sizeof(b), "sem acelerador/mmio ainda"); return SYSCTL_OUT(req, b, (size_t)o + 1); }
-	static const struct { uint32_t ini, fim; } fx[] = {{0x2000, 0x2300}, {0x22000, 0x22300}, {0x1a000, 0x1a300}, {0x190000, 0x1900f0}};
+	static const struct { uint32_t ini, fim; } fx[] = {{0x2000, 0x2300}, {0x22000, 0x22300}, {0x1a000, 0x1a300}, {0x190000, 0x1900f0}, {0xa000, 0xa100}, {0xa160, 0xa170}, {0x138100, 0x1381c0}};
 	Gen11::xeForceWakePub(acc, true, 0b101, 3);
 	for (auto &f : fx) {
 		for (uint32_t r = f.ini; r < f.fim && !err; r += 4) {
