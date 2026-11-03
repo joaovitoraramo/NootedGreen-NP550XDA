@@ -106,11 +106,14 @@ and a benchmark context that did not go through the reset, keep normal speed. Ki
 reset. In the stuck state 30 of 30 samples show `EXECLIST_STATUS` 0x2098 or 0x12098, HEAD == TAIL (empty ring), IPEHR 0x03800000,
 INSTDONE with only CS not done, two elements in the execlist port, and the driver's CSB head equal to the hardware's.
 
-Ruled out so far: skipping `restoreFromSafeImage`, skipping `affectedByHardwareReset`, FORCE_RESTORE on those contexts (leaves the
-empty ring but hangs at 3DPRIMITIVE, more resets), restoring changed MMIO registers. Clearing the POSH flag in the kernel
-without also clearing `CTX_CTRL` bit 4 froze the machine on reset (2 of 2). Being tested: POSH off done properly, and forcewake plus
-ELSQ waits around the submission. The kext switches for these are `debug.xeng.safeimg`, `noaffected`, `forcerestore`,
-`noposh`, `prepfix`, all at the default (Apple) behaviour unless set.
+**POSH off is now the default** (`xe/noposh`, `-ngreenposhctx` keeps it): clear `ctx+0x6e` bit 0x10 at creation, plus `CTX_CTRL` bit 4 and `POSH_LRCA` from the safe image.
+That removed the empty-ring stall and the chain of resets (1 reset stays 1, it used to reach 13). It did **not** cure the slowdown: after one reset, video in a
+window still gives 38 fps instead of 57, render engine 98%, IPEHR `PIPE_CONTROL` in the ring postamble, EU rows busy, same batch heads. Measure this logged in: the login
+screen hides it (107 fps both ways).
+
+Ruled out for the slowdown, logged in: keeping the whole image through the reset (`safeimg=2`, 0x4200 stays but the problem does not go), clearing `CTX_CTRL` bit 8 (`ctlfix`, the bit
+goes away, the slowdown does not, so it is a side effect), `debug.intel.oaEnable=0`, submission forcewake and ELSQ waits (`prepfix`). `noaffected` and `forcerestore` were only tested
+without a session. Earlier: restoring changed MMIO registers, interrupts. Still to check: full batch contents, `FORCE_TO_NONPRIV`, user-space state of the WindowServer.
 
 ### 3. Video windows saturate the RCS
 

@@ -548,6 +548,8 @@ static XeSameTailEnt gSameTailPrev = {};
 static inline bool xeKptr(uint64_t p) { return (p >> 47) == 0x1ffff; }
 // xe/forcerestore (03/11): contextos que passaram por um reset (lista preenchida em xeBeginReset) recebem FORCE_RESTORE a cada
 // submissão quando `sysctl debug.xeng.forcerestore=1`: experimento contra o RCS parado em 0x2098 com o anel vazio.
+static mach_vm_address_t gGetVirt = 0;
+static volatile int gXeCtlFix = 0; static volatile uint32_t gXeCtlFixN = 0, gXeCtlFixMudou = 0;   // xe/ctlfix
 static void *volatile gCtxResetados[8]; static volatile int gForceRestore = 0;
 static volatile uint32_t gForceRestoreN = 0;
 static void xeSameTail(void *that) {
@@ -13690,6 +13692,7 @@ static int xeCsState2Sysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struc
 	return SYSCTL_OUT(req, b, (size_t)o + 1);
 }
 static int gSafeImg = 1;   // xe/ctxdiff
+static int xeCtxImgSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);
 extern volatile int gXeNoAffected;   // kern_green.cpp
 static int xeCtxDifSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);
 static int xeIrqStatSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);   // xe/irqdiag (definidos mais abaixo)
@@ -13712,6 +13715,10 @@ SYSCTL_PROC(_debug_xeng, OID_AUTO, csstate, CTLTYPE_STRING | CTLFLAG_RD | CTLFLA
 SYSCTL_INT(_debug_xeng, OID_AUTO, noposh, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, &gXeNoPosh, 0, "1 = contextos novos sem POSH");
 SYSCTL_UINT(_debug_xeng, OID_AUTO, noposhn, CTLFLAG_RD | CTLFLAG_LOCKED, &gXeNoPoshN, 0, "contextos com POSH apagado");
 SYSCTL_INT(_debug_xeng, OID_AUTO, prepfix, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, &gXePrepFix, 0, "1 = forcewake e espera na submissao");
+SYSCTL_PROC(_debug_xeng, OID_AUTO, ctximg, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, nullptr, 0, xeCtxImgSysctl, "A", "imagem do contexto do anel 1 antes x depois");
+SYSCTL_INT(_debug_xeng, OID_AUTO, ctlfix, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, const_cast<int *>(&gXeCtlFix), 0, "1 = limpa CTX_CTRL na imagem dos contextos resetados");
+SYSCTL_UINT(_debug_xeng, OID_AUTO, ctlfixn, CTLFLAG_RD | CTLFLAG_LOCKED, const_cast<uint32_t *>(&gXeCtlFixN), 0, "");
+SYSCTL_UINT(_debug_xeng, OID_AUTO, ctlfixm, CTLFLAG_RD | CTLFLAG_LOCKED, const_cast<uint32_t *>(&gXeCtlFixMudou), 0, "");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, poke, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, nullptr, 0, xePokeSysctl, "A", "escreve registrador: \"reg val\" hex");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, regs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRegsSysctl, "A", "registradores ao vivo");
 SYSCTL_PROC(_debug_xeng, OID_AUTO, ringsample, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xeRingSampleSysctl, "A", "amostra do que os aneis executam");
@@ -13724,6 +13731,10 @@ static void xeRegsSysctlInstall() {
 	sysctl_register_oid(&sysctl__debug_xeng_ringsample);
 	sysctl_register_oid(&sysctl__debug_xeng_ringregs);
 	sysctl_register_oid(&sysctl__debug_xeng_poke);
+	sysctl_register_oid(&sysctl__debug_xeng_ctlfix);
+	sysctl_register_oid(&sysctl__debug_xeng_ctlfixn);
+	sysctl_register_oid(&sysctl__debug_xeng_ctlfixm);
+	sysctl_register_oid(&sysctl__debug_xeng_ctximg);
 	sysctl_register_oid(&sysctl__debug_xeng_prepfix);
 	sysctl_register_oid(&sysctl__debug_xeng_noposh);
 	sysctl_register_oid(&sysctl__debug_xeng_noposhn);
@@ -14085,7 +14096,29 @@ static int xeIrqFixSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct 
 // xe/realsubmit (03/11): no TGL real submitExecList não é roteado (xeCs5Submit só existe com -ngreenxefix), logo xeSameTail nunca roda.
 // Gancho mínimo para o FORCE_RESTORE: sem log e sem thread, só o flag antes da submissão original.
 static mach_vm_address_t gOrgRealSubmit = 0;
-static uint64_t xeRealSubmit(void *that, uint32_t x) { xeCsGuarda(that); if (gForceRestore) xeSameTail(that); return FunctionCast(xeRealSubmit, gOrgRealSubmit)(that, x); }
+// xe/ctlfix (03/11): depois de um reset o CTX_CTRL do contexto salvo fica com o bit 8 (OAR) ligado e o WindowServer desenha ~25 ms a mais por
+// quadro. `sysctl debug.xeng.ctlfix=1`: antes de cada submissão, a imagem dos contextos que passaram por reset volta a CTX_CTRL = ffff0000.
+static uint64_t xeRealSubmit(void *that, uint32_t x) {
+	xeCsGuarda(that);
+	if (gForceRestore) xeSameTail(that);
+	if (gXeCtlFix && gGetVirt) {
+		auto *cs = static_cast<uint8_t *>(that);
+		for (int p = 0; p < 4; p++) {
+			auto *it = *reinterpret_cast<uint8_t **>(cs + 0x30 + p * 8);
+			if (!xeKptr((uint64_t)it)) continue;
+			auto *c = *reinterpret_cast<uint8_t **>(it);
+			if (!xeKptr((uint64_t)c)) continue;
+			bool achou = false; for (auto &r : gCtxResetados) if (r == c) achou = true;
+			if (!achou) continue;
+			void *mb = *reinterpret_cast<void **>(c + 0x98);
+			auto *img = mb ? static_cast<uint32_t *>(reinterpret_cast<void *(*)(void *)>(gGetVirt)(mb)) : nullptr;
+			if (!img) continue;
+			gXeCtlFixN++;
+			if (img[0x100c / 4] != 0xffff0000u) { img[0x100c / 4] = 0xffff0000u; gXeCtlFixMudou++; }
+		}
+	}
+	return FunctionCast(xeRealSubmit, gOrgRealSubmit)(that, x);
+}
 // xe/prepfix (03/11): as correções de submissão do XPS (xe/elsqwait, forcewake na submissão) só existem com -ngreenxefix, que o TGL real
 // não usa. No estado degradado o EXECLIST_STATUS mostra 0x40002098 (salvamento em andamento) e o RCS fica com o anel vazio: suspeita de
 // escrita perdida na ELSQ. `sysctl debug.xeng.prepfix=1`: forcewake durante a submissão, espera o bit 30 cair (até 2 ms) e, havendo
@@ -14107,12 +14140,54 @@ static uint64_t xeRealPrep(void *that, uint32_t a, uint32_t b, const uint32_t *c
 	if (acc) Gen11::xeForceWakePub(acc, false, 0b101, 3);
 	return r;
 }
+// xe/ctximg (03/11): o WindowServer manda os mesmos lotes antes e depois do reset, mas o desenho fica lento só no contexto dele. Sobra o estado
+// do contexto. `sysctl -w debug.xeng.ctximg=1` (antes do reset) e `=2` (depois) copiam a imagem do contexto do anel 1 enquanto ele está nas
+// portas do RCS; a leitura lista as diferenças da página de estado em diante (registrador da dupla LRI, valor antes, valor depois).
+static uint8_t gCtxImg[2][0x6000]; static void *gCtxImgPtr[2]; static uint32_t gCtxImgTent[2];
+static bool xeCtxImgPega(int q) {
+	auto *cs = gCs5Obj[0];
+	if (!cs || !gGetVirt) return false;
+	for (uint32_t t = 0; t < 3000; t++) {
+		for (int p = 0; p < 4; p++) {
+			auto *it = *reinterpret_cast<uint8_t **>(cs + 0x30 + p * 8);
+			if (!xeKptr((uint64_t)it)) continue;
+			auto *c = *reinterpret_cast<uint8_t **>(it);
+			if (!xeKptr((uint64_t)c)) continue;
+			auto *x = *reinterpret_cast<uint8_t **>(c + 0xb8);
+			if (!xeKptr((uint64_t)x)) continue;
+			auto *rb = *reinterpret_cast<uint8_t **>(x + 0x130);
+			if (!xeKptr((uint64_t)rb) || *reinterpret_cast<int *>(rb + 0x38) != 1) continue;
+			void *mb = *reinterpret_cast<void **>(c + 0x98);
+			auto *img = mb ? static_cast<uint8_t *>(reinterpret_cast<void *(*)(void *)>(gGetVirt)(mb)) : nullptr;
+			if (!img) continue;
+			memcpy(gCtxImg[q], img, sizeof(gCtxImg[q])); gCtxImgPtr[q] = c; gCtxImgTent[q] = t;
+			return true;
+		}
+		IODelay(1000);
+	}
+	return false;
+}
+static int xeCtxImgSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
+	static char b[12000]; int o = 0;
+	if (req->newptr) {
+		char s[8] = {0}; size_t n = req->newlen < 7 ? req->newlen : 7; int err = SYSCTL_IN(req, s, n); if (err) return err;
+		int q = s[0] == '2' ? 1 : 0;
+		bool ok = xeCtxImgPega(q);
+		IOLog("XeNG CTXIMG[%d]: %s ctx %p tentativas %u\n", q + 1, ok ? "copiada" : "contexto do anel 1 nao apareceu", gCtxImgPtr[q], gCtxImgTent[q]);
+		return ok ? 0 : EBUSY;
+	}
+	auto *a = reinterpret_cast<uint32_t *>(gCtxImg[0]), *d = reinterpret_cast<uint32_t *>(gCtxImg[1]); uint32_t tot = 0;
+	o += snprintf(b + o, sizeof(b) - (size_t)o, "ctx antes %p depois %p\n", gCtxImgPtr[0], gCtxImgPtr[1]);
+	for (uint32_t i = 0x400; i < sizeof(gCtxImg[0]) / 4; i++) if (a[i] != d[i]) { tot++; if (o < (int)sizeof(b) - 60) o += snprintf(b + o, sizeof(b) - (size_t)o, "%05x reg %x: %x -> %x\n", i * 4, a[i - 1], a[i], d[i]); }
+	o += snprintf(b + o, sizeof(b) - (size_t)o, "diferencas: %u\n", tot);
+	return SYSCTL_OUT(req, b, (size_t)o + 1);
+}
 // xe/ctxdiff (03/11): um único reset deixa o WindowServer lento até morrer, e contextos criados depois ficam rápidos. No reset,
 // IGHardwareContext::beginReset copia a imagem segura por cima da imagem do contexto RCS que estava na porta
 // (restoreFromSafeImage, a mesma cópia de initWithOptions, que depois recebe a inicialização completa). Sem IOLog (caminho de reset):
 // compara a imagem do contexto com a imagem segura e guarda as diferenças, lidas por `sysctl debug.xeng.ctxdiff`.
 // `sysctl -w debug.xeng.safeimg=0` mantém a imagem do contexto no reset (experimento).
-static mach_vm_address_t gOrgBeginReset = 0, gOrgCtxRestoreSafe = 0, gGetVirt = 0;
+static mach_vm_address_t gOrgBeginReset = 0, gOrgCtxRestoreSafe = 0;
 static void *volatile gBeginResetCtx = nullptr;
 struct XeCtxDif { uint32_t idx, reg, antes, depois; };
 static XeCtxDif gCtxDif[200]; static uint32_t gCtxDifN = 0, gCtxDifTot = 0, gCtxResets = 0, gCtxPulos = 0; static void *gCtxUlt = nullptr;
@@ -14128,6 +14203,9 @@ static bool xeCtxRestoreSafe(void *ctx) {
 				uint32_t n = 0, tot = 0;
 				for (uint32_t i = 1; i < 0x6000 / 4; i++) if (img[i] != src[i]) { tot++; if (n < 200) gCtxDif[n++] = {i, img[i - 1], img[i], src[i]}; }
 				gCtxDifN = n; gCtxDifTot = tot; gCtxUlt = ctx; gCtxResets++;
+				// safeimg=2 (03/11): mantém a imagem inteira, inclusive +0x1318 (0x4200, base da tabela AUX) e o estado de L3/3D em +0x2400,
+				// que a imagem segura zera e que só um contexto novo recebe. safeimg=0 é o teste antigo, que zerava +0x1318.
+				if (gSafeImg == 2) { gCtxPulos++; return true; }
 				if (!gSafeImg) { for (int k = 0; k < 5; k++) img[0x1318 / 4 + k] = 0; gCtxPulos++; return true; }
 			}
 		}
@@ -14257,6 +14335,8 @@ static void xeStfInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t
 	}
 	{
 		gGetVirt = patcher.solveSymbol(index, "__ZNK20IGSharedMappedBuffer17getVirtualAddressEv", address, size); patcher.clearError();
+		// xe/noposh: padrão desde 03/11, como no XPS. Com POSH o contexto que passa por um reset fica preso no anel vazio até o WindowServer morrer. -ngreenposhctx mantém.
+		gXeNoPosh = checkKernelArgument("-ngreenposhctx") ? 0 : 1;
 		RouteRequestPlus rc[] = {   // xe/ctxdiff
 			{"__ZN17IGHardwareContext10beginResetEv", xeBeginReset, gOrgBeginReset},
 			{"__ZN26IGHardwareCommandStreamer514submitExecListEj", xeRealSubmit, gOrgRealSubmit},   // xe/realsubmit
