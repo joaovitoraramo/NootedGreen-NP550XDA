@@ -13458,6 +13458,30 @@ static void xeRecProc(void *sched, uint32_t type, void *ctx) {
 	orig(sched, type, ctx);
 }
 
+// xe/regdiff: compara registradores da GT antes e depois de um reset do RCS, e entre resets. Depois dos resets com vídeo o
+// WindowServer atualiza a tela 13x menos sem bloquear na GPU (ws-medir.sh): procura o que o reset deixa diferente.
+static const struct { uint32_t ini, fim; } kXeRegFx[] = {
+	{0x2080, 0x2090}, {0x209c, 0x20b0}, {0x20c0, 0x2110}, {0x2220, 0x2240}, {0x2290, 0x22a0},
+	{0x7000, 0x7400}, {0x9400, 0x9440}, {0x94d0, 0x94f0}, {0xa000, 0xa100}, {0xb100, 0xb200},
+	{0xe100, 0xe200}, {0xe400, 0xe500}, {0x190000, 0x1900f0}, {0x44400, 0x44420}, {0x44200, 0x44210},
+};
+static constexpr uint32_t kXeRegMax = 1400;
+static uint32_t gXeRegAntes[kXeRegMax], gXeRegBase[kXeRegMax];
+static bool gXeRegBaseOk = false;
+static uint32_t xeRegLe(volatile uint8_t *mmio, uint32_t *out) {
+	uint32_t n = 0;
+	for (auto &f : kXeRegFx) for (uint32_t r = f.ini; r < f.fim && n < kXeRegMax; r += 4) out[n++] = xeRecRd(mmio, r);
+	return n;
+}
+static void xeRegCompara(const char *rot, const uint32_t *a, volatile uint8_t *mmio, uint32_t lim) {
+	uint32_t n = 0, dif = 0;
+	for (auto &f : kXeRegFx) for (uint32_t r = f.ini; r < f.fim && n < kXeRegMax; r += 4, n++) {
+		uint32_t v = xeRecRd(mmio, r);
+		if (v == a[n]) continue;
+		if (dif++ < lim) IOLog("XeNG REGDIFF %s: %06x %08x -> %08x\n", rot, r, a[n], v);
+	}
+	IOLog("XeNG REGDIFF %s: %u registradores diferentes de %u\n", rot, dif, n);
+}
 static bool xeRecResetGraphicsEngine(void *ring, void *ctx) {
 	auto orig = FunctionCast(xeRecResetGraphicsEngine, gOrgRge);
 	auto *r = static_cast<uint8_t *>(ring);
@@ -13501,6 +13525,13 @@ static bool xeRecResetGraphicsEngine(void *ring, void *ctx) {
 			xeBbDump(ring, acthd, bb);
 		}
 	}
+	static uint32_t nRegDiff = 0;
+	bool regDiff = own == 0 && nRegDiff < 6;
+	if (regDiff) {
+		if (gXeRegBaseOk) xeRegCompara("desde-o-1o-antes", gXeRegBase, mmio, 48);
+		xeRegLe(mmio, gXeRegAntes);
+		if (!gXeRegBaseOk) { for (uint32_t i = 0; i < kXeRegMax; i++) gXeRegBase[i] = gXeRegAntes[i]; gXeRegBaseOk = true; }
+	}
 	xeRecExSnapshot(acc, mmio);
 	gRecPendAcc = acc; gRecPendMmio = mmio;     // xeRecProc() re-applies the extras between GDRST and Apple's replay
 	bool ret = orig(ring, ctx);
@@ -13539,6 +13570,7 @@ static bool xeRecResetGraphicsEngine(void *ring, void *ctx) {
 		gRecSkipKick++;
 	}
 	if (exDid) did |= 8;
+	if (regDiff) { xeRegCompara("antes-depois", gXeRegAntes, mmio, 64); nRegDiff++; }
 	sfw(acc, false, 7);
 	gRecLast = (uint32_t)own | ((uint32_t)ret << 4) | ((uint32_t)kick << 5) | (did << 8) | ((snap[0] >> 12) << 12);
 	xeEv('GREC', gRecLast, snap[0], sibHws);
