@@ -13495,21 +13495,20 @@ static int xeRingSampleSysctl(struct sysctl_oid *oidp, void *arg1, int arg2, str
 	Gen11::xeForceWakePub(acc, true, 0b101, 3);
 	const uint32_t bases[2] = {0x2000, 0x22000}; const char *nomes[2] = {"RCS", "BCS"};
 	for (int e = 0; e < 2; e++) {
-		uint32_t ip[8] = {0}, ipn[8] = {0}, ocup = 0, acthdDist = 0, lastAct = 0xffffffff, mesmoAct = 0; uint32_t bs = bases[e];
+		uint32_t ip[8] = {0}, ipn[8] = {0}, el[6] = {0}, eln[6] = {0}, acthdDist = 0, lastAct = 0xffffffff, mesmoAct = 0; uint32_t bs = bases[e];
 		for (int k = 0; k < 200; k++) {
 			uint32_t st = xeRecRd(mmio, bs + 0x234), ipehr = xeRecRd(mmio, bs + 0x68), acthd = xeRecRd(mmio, bs + 0x74);
-			bool busy = (st & 0x1) || ((st >> 15) & 1) || ((st >> 16) & 1);
-			if (busy) {
-				ocup++;
-				int j; for (j = 0; j < 8; j++) { if (ipn[j] == 0 || ip[j] == ipehr) { ip[j] = ipehr; ipn[j]++; break; } }
-				if (acthd == lastAct) mesmoAct++; else acthdDist++;
-				lastAct = acthd;
-			}
+			int j; for (j = 0; j < 8; j++) { if (ipn[j] == 0 || ip[j] == ipehr) { ip[j] = ipehr; ipn[j]++; break; } }
+			for (j = 0; j < 6; j++) { if (eln[j] == 0 || el[j] == st) { el[j] = st; eln[j]++; break; } }
+			if (acthd == lastAct) mesmoAct++; else acthdDist++;
+			lastAct = acthd;
 			IODelay(10000);
 		}
-		o += snprintf(b + o, sizeof(b) - (size_t)o, "%s: ocupado %u/200 acthd-distintos %u acthd-repetido %u ipehr:", nomes[e], ocup, acthdDist, mesmoAct);
+		o += snprintf(b + o, sizeof(b) - (size_t)o, "%s: acthd-distintos %u repetido %u elstat:", nomes[e], acthdDist, mesmoAct);
+		for (int j = 0; j < 6 && eln[j]; j++) o += snprintf(b + o, sizeof(b) - (size_t)o, " %05x*%u", el[j], eln[j]);
+		o += snprintf(b + o, sizeof(b) - (size_t)o, " ipehr:");
 		for (int j = 0; j < 8 && ipn[j]; j++) o += snprintf(b + o, sizeof(b) - (size_t)o, " %08x*%u", ip[j], ipn[j]);
-		o += snprintf(b + o, sizeof(b) - (size_t)o, " elstat=%08x; ", xeRecRd(mmio, bs + 0x234));
+		o += snprintf(b + o, sizeof(b) - (size_t)o, "; ");
 	}
 	Gen11::xeForceWakePub(acc, false, 0b101, 3);
 	return SYSCTL_OUT(req, b, (size_t)o + 1);
@@ -13765,6 +13764,29 @@ static void xeDisStampIrq(void *em, int idx, int flag) {
 	if (xeStampIrqJanela() && gStampIrqLogN++ < 60) IOLog("XeNG STAMPIRQ: disable idx %d flag %d -> mascara %llx n=%llu soft=%llu\n", idx, flag,
 		*reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(em) + 0xd40), *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(em) + 0xd80), *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(em) + 0xd90));
 }
+// xe/semdiag (03/11): o RCS passa ~30 ms por quadro em MI_SEMAPHORE_WAIT (poll) nos quadros do WindowServer degradado.
+// Loga as esperas inseridas no anel: índice do anel, índice esperado (widx), valor pedido e o que o stamp esperado já
+// tem (retornado/enviado). Primeiras 24 no boot e 80 nos 120 s após um reset; depois 1 a cada 2048.
+static mach_vm_address_t gOrgSemPoll = 0;
+static uint64_t xeSemPollDiag(void *ring, uint32_t value, int widx) {
+	uint64_t r = FunctionCast(xeSemPollDiag, gOrgSemPoll)(ring, value, widx);
+	static uint32_t n = 0, nPos = 0; static uint64_t ultimoReset = 0;
+	n++;
+	bool pos = gRecLastResetT && gRecAbs3s && mach_absolute_time() - gRecLastResetT < gRecAbs3s * 40;
+	if (pos && ultimoReset != gRecLastResetT) { ultimoReset = gRecLastResetT; nPos = 0; }
+	if (!(n <= 24 || (pos && nPos++ < 80) || !(n & 2047))) return r;
+	auto *rb = static_cast<uint8_t *>(ring);
+	auto *acc = rb ? *reinterpret_cast<uint8_t **>(rb + 0x10) : nullptr;
+	uint32_t ret = 0, sub = 0;
+	if (acc && gStfGetStamps && widx >= 0 && widx < 64) {
+		auto *task = *reinterpret_cast<void **>(acc + 0x150);
+		auto *st = task ? reinterpret_cast<volatile uint32_t *>(reinterpret_cast<void *(*)(void *)>(gStfGetStamps)(task)) : nullptr;
+		if (st) { ret = st[(uint32_t)widx * 16]; sub = st[(uint32_t)widx * 16 + 2]; }
+	}
+	IOLog("XeNG SEMWAIT[%u]: anel idx %d tipo %u espera stamp %d >= 0x%x (retornado 0x%x enviado 0x%x)%s ret=%llu\n", n, rb ? *reinterpret_cast<int *>(rb + 0x38) : -1,
+	      rb ? rb[0x40] : 0xff, widx, value, ret, sub, (int32_t)(value - ret) > 0 ? " PENDENTE" : "", r);
+	return r;
+}
 static uint32_t gStampPrevRet[64], gStampPrevSub[64], gDispFixN = 0;
 static void xeStampScan(void *accv) {
 	auto *acc = static_cast<uint8_t *>(accv);
@@ -13812,6 +13834,7 @@ static void xeStfInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		RouteRequestPlus ri[] = {
 			{"__ZN19IGAccelEventMachine20enableStampInterruptEii", xeEnStampIrq, gOrgEnStampIrq},
 			{"__ZN19IGAccelEventMachine21disableStampInterruptEii", xeDisStampIrq, gOrgDisStampIrq},
+			{"__ZN20IGHardwareRingBuffer23insertSemaphoreWaitPollEji", xeSemPollDiag, gOrgSemPoll},   // xe/semdiag
 		};
 		bool ok = RouteRequestPlus::routeAll(patcher, index, ri, address, size);
 		if (!ok) patcher.clearError();
