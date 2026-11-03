@@ -13989,8 +13989,8 @@ static void xeStfInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			{"__ZN17IGInterruptBridge17disableInterruptsEv", xeIbDisables, gOrgIbDisables},
 			{"__ZN17IGInterruptBridge15clearRequestorsEv", xeIbClear, gOrgIbClear},
 			{"__ZN17IGInterruptBridge16interruptHandlerEP22IOInterruptEventSourcei", xeIbHandler, gOrgIbHandler},
-			{"__ZN26IGHardwareCommandStreamer533handleHardwareFlushNotifyInterruptEP8OSObjectPv", xeCsFlushHw, gOrgCsFlushHw},
-			{"__ZN26IGHardwareCommandStreamer534handleFlushNotifyInterruptSecondaryEP22IOInterruptEventSourcei", xeCsFlush2, gOrgCsFlush2},
+			{"__ZN26IGHardwareCommandStreamer534handleHardwareFlushNotifyInterruptEP8OSObjectPv", xeCsFlushHw, gOrgCsFlushHw},
+			{"__ZN26IGHardwareCommandStreamer535handleFlushNotifyInterruptSecondaryEP22IOInterruptEventSourcei", xeCsFlush2, gOrgCsFlush2},
 			{"__ZN26IGHardwareCommandStreamer520enableStampInterruptEi", xeCsEnStamp, gOrgCsEnStamp},
 			{"__ZN26IGHardwareCommandStreamer521disableStampInterruptEi", xeCsDisStamp, gOrgCsDisStamp},
 		};
