@@ -13808,7 +13808,20 @@ static void *xeStfEventTimeout(void *em, int idx) {
 	if (!vt || vt[0x198 / 8] != gStfActive) { XE_STF_DECL("vtable do scheduler"); return ch; }
 	void *a = nullptr, *b = nullptr; uint64_t t = 0;
 	reinterpret_cast<void (*)(void *, uint32_t, void **, uint64_t *, void **)>(gStfActive)(sched, cs, &a, &t, &b);
-	if (a || b) { gStfN = 0; XE_STF_DECL("motor cs %u ainda tem contexto ativo (ret %x sub %x) a=%d b=%d", cs, ret, sub, a != nullptr, b != nullptr); return ch; }
+	// xe/stampfix-orfao (03/11): a Apple já disse que o stamp não tem canal (ch == nullptr). Se o processo que submeteu por
+	// último nesse índice já morreu, ou se o mesmo stamp órfão estoura o timeout 3 vezes seguidas (~3 s), completa mesmo com
+	// contexto ativo no motor: antes a recusa deixava o laço de restart da Apple (1/s, "no channel associated with
+	// stamp_idx") rodar para sempre, congelando a sessão (02/11 23:05) e travando o desligamento (03/11 11:56).
+	static uint32_t orfN[64] = {0};
+	int dono = gStampOwnerPid[idx]; bool donoMorto = false;
+	if (dono > 0) { proc_t pr = proc_find(dono); if (pr) proc_rele(pr); else donoMorto = true; }
+	if (a || b) {
+		orfN[idx]++;
+		if (!donoMorto && orfN[idx] < 3) { gStfN = 0; XE_STF_DECL("motor cs %u ainda tem contexto ativo (ret %x sub %x) a=%d b=%d dono %d vivo, timeout %u/3", cs, ret, sub, a != nullptr, b != nullptr, dono, orfN[idx]); return ch; }
+		IOLog("XeNG STAMPFIX: idx %d orfao: dono pid %d %s, %u timeouts, motor cs %u com contexto ativo: completando\n", idx, dono, donoMorto ? "morto" : "vivo", orfN[idx], cs);
+		gStfN = 2;   // completa já
+	}
+	orfN[idx] = 0;
 	if (gStfIdx == (uint32_t)idx && gStfVal == sub) gStfN++;
 	else { gStfIdx = (uint32_t)idx; gStfVal = sub; gStfN = 1; }
 	if (gStfN < 2) return ch;
