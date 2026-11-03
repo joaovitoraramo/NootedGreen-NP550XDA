@@ -750,7 +750,7 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		// xe/dropdiag (02/11 23h): depois dos resets com vídeo, o IOAF descarta envios de algum contexto ("dropping ctx ...
 		// commands on floor") e o desktop fica lento até o reboot. Diz de quem é o contexto descartado.
 		RouteRequestPlus dropRequest[] = {
-			{"__ZN18IOAccelFIFOChannel214submitCommandsEP24IOAccelCommandDescriptor", wrapChSubmitCommands, orgChSubmitCommands},
+			{"__ZN19IOAccelFIFOChannel214submitCommandsEP24IOAccelCommandDescriptor", wrapChSubmitCommands, orgChSubmitCommands},
 		};
 		if (!RouteRequestPlus::routeAll(patcher, index, dropRequest, address, size)) { patcher.clearError(); IOLog("XeNG DROPDIAG: hook FALHOU\n"); }
 		else IOLog("XeNG DROPDIAG: hook submitCommands OK\n");
@@ -777,7 +777,7 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			{"__ZN18IOAccelDisplayPipe19completeTransactionEP30IOAccelDisplayPipeTransaction2", wrapDpComplete, orgDpComplete},
 			{"__ZN18IOAccelDisplayPipe23transaction_queue_gatedEP30IOAccelDisplayPipeTransaction2", wrapDpQueue, orgDpQueue},
 		};
-		if (checkKernelArgument("-ngreenxefix")) {
+		if (!checkKernelArgument("-ngreennoflipdiag")) {   // 02/11: sempre ligado (tela a 18-21 fps depois de resets com vídeo: irq x timeout)
 			bool ok = RouteRequestPlus::routeAll(patcher, index, dpRequest, address, size);
 			if (!ok) patcher.clearError();
 			IOLog("XeNG FLIP diag IOAF2 hooks: %s\n", ok ? "OK" : "FALHOU");
