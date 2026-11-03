@@ -36,7 +36,7 @@ ngreencon3type=2048 -ngreenhdmiemu -ngreenhdmiout -ngreenhdmigammaoff -ngreentgl
 - Metal / 3D acceleration, WindowServer at 60 Hz, App Store, Xcode 26.1.1, iOS 26.1 simulator, Docker Desktop.
 - Hardware video decode (H.264, HEVC, HEVC 10-bit) through the patched VA plugin (`-ngreengva`).
 - Internal panel brightness (`-ngreenblr`, `ngreenblmax=`), display sleep with backlight only (`-ngreenfbdpmstgl`), BrightnessKeys.
-- External display over USB-C DisplayPort alt mode (1080p). Native HDMI port: experimental (pipe B / TC1 path, see commits `HDMIEMU`/`HDMIOUT`).
+- External displays: the native HDMI port (pipe B on the TC1 DDI, lit through the `HDMIEMU`/`HDMIOUT` path) works perfectly, and so does USB-C DisplayPort alt mode (1080p).
 - Sleep is disabled by policy (`pmset sleep 0`); not investigated yet.
 
 ## Stability (as of 2026-11-03)
@@ -57,7 +57,7 @@ ngreencon3type=2048 -ngreenhdmiemu -ngreenhdmiout -ngreenhdmigammaoff -ngreentgl
 | `XE-FBDPMS` (`-ngreenfbdpmstgl`) | Display sleep by backlight only (full DPMS kills the panel on this machine). |
 | `XE-FENCE` | Limit the boot framebuffer fence to 32 MB (cursor at 0x02040000 rendered as blocks). |
 | `TGLCON`, `ngreencon<N>type/pipe/busid` | Dump and override the native connector table of real TGL. |
-| `HDMIEMU`/`HDMIOUT` | Emulated DP sink on DDI 3 so AGDC lights pipe B on the TC1 HDMI port (experimental). |
+| `HDMIEMU`/`HDMIOUT` | Native HDMI port: emulated DP sink on DDI 3 so AGDC creates the framebuffer, then pipe B / TC1 DDI / Dekel PHY / HDMI PLL programmed by the kext (8 bpc 148.5 MHz, DBUF slice S2, RGB output). Working. |
 | USB-C DP series (`USB-C DP:` commits) | Link training on DDI B following the i915 sequence: AUX power wells before training, DPCD 0x108 then 0x102, TRAINING_PATTERN_SET with lanes in one transaction, PHY combo B signal values from a Linux dump, N scalar, DCC clock select. Result: USB-C alt-mode 1080p works. |
 | `AUX timeout` | Connector 3 has no AUX; answer timeout immediately (were 2240 x 6 ms on the login screen). |
 | `XE-PWR` | RAPL PL1 via MCHBAR (BIOS leaves 10 W): 28 W on AC regulated by temperature, 15 W on battery. |
